@@ -190,7 +190,7 @@ async fn execute(
                 "symbol": command.symbol,
                 "volume": command.volume,
                 "magic": magic,
-                "clientId": short_client_id(&command.command_id)
+                "clientId": metaapi_client_id(&command.command_id)
             })
         }
         TradeAction::Modify => json!({
@@ -203,13 +203,13 @@ async fn execute(
             "positionId": position_id,
             "volume": command.volume,
             "magic": magic,
-            "clientId": short_client_id(&command.command_id)
+            "clientId": metaapi_client_id(&command.command_id)
         }),
         TradeAction::Close => json!({
             "actionType": "POSITION_CLOSE_ID",
             "positionId": position_id,
             "magic": magic,
-            "clientId": short_client_id(&command.command_id)
+            "clientId": metaapi_client_id(&command.command_id)
         }),
     };
     if matches!(command.action, TradeAction::Open | TradeAction::Modify) {
@@ -268,8 +268,14 @@ async fn execute(
         .and_then(value_to_string)
         .or_else(|| position_id.clone());
     let ack_status = match code {
-        "TRADE_RETCODE_DONE" | "TRADE_RETCODE_DONE_PARTIAL" => AckStatus::Filled,
-        "TRADE_RETCODE_PLACED" => AckStatus::Accepted,
+        "TRADE_RETCODE_DONE" | "ERR_NO_ERROR" | "TRADE_RETCODE_NO_CHANGES" => AckStatus::Filled,
+        "TRADE_RETCODE_PLACED"
+        | "TRADE_RETCODE_DONE_PARTIAL"
+        | "TRADE_RETCODE_DISCONNECTED_DURING_TRADE"
+        | "TRADE_RETCODE_TIMEOUT"
+        | "ERR_TRADE_TIMED_OUT"
+        | "ERR_NO_RESULT"
+        | "TRADE_RETCODE_UNKNOWN" => AckStatus::Unknown,
         _ => AckStatus::Rejected,
     };
     ExecutionAck {
@@ -294,9 +300,16 @@ fn rejected(command: &ExecutionCommand, message: &str) -> ExecutionAck {
     }
 }
 
-fn short_client_id(command_id: &str) -> String {
-    let prefix: String = command_id.chars().take(20).collect();
-    format!("cr_{prefix}")
+fn metaapi_client_id(command_id: &str) -> String {
+    let compact: String = command_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(20)
+        .collect();
+    let split_at = compact.len().min(10);
+    let (left, right) = compact.split_at(split_at);
+    let right = if right.is_empty() { "0" } else { right };
+    format!("CR_{left}_{right}")
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -375,7 +388,7 @@ fn to_event(
     };
     let now = unix_time_ns();
     let origin_command_id = position.client_id.as_deref()
-        .filter(|value| value.starts_with("cr_"))
+        .filter(|value| value.starts_with("CR_"))
         .map(str::to_owned);
     let event = TradeEvent {
         event_id: format!("metaapi:{}:{}:{}:{}", account.id, position.id, action, now),
