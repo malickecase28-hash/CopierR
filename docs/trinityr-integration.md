@@ -1,7 +1,6 @@
 # TrinityR integration
 
-CopierR should sit after TrinityR's permission and sizing boundary, not inside
-the detector path.
+CopierR sits after TrinityR's permission and primary sizing boundary, not inside the detector path.
 
 ```text
 TrinityR detector / strategy
@@ -15,16 +14,20 @@ Trinity durable intent
           v
 copier-client -> CopierR route fan-out
           |
-          v
-MT4 / MT5 / cTrader terminal agents
-          |
-          v
-broker acknowledgement / UNKNOWN
+          +----------------------+------------------+
+          |                      |                  |
+          v                      v                  v
+ cTrader Open API        MetaApi MT4/MT5      future venue
+          |                      |                  |
+          +----------------------+------------------+
+                                 |
+                                 v
+                    broker ACK / UNKNOWN
 ```
 
-CopierR's route sizing is follower-account transformation. It does not grant a
-strategy permission to trade and should not replace TrinityR's primary risk
-authority.
+CopierR route sizing is follower-account transformation. It does not grant a strategy permission to trade and should not replace TrinityR's primary risk authority.
+
+TrinityR remains a local/native `agent` account. Direct broker/cloud venues are internal CopierR sessions and do not use the local agent listener.
 
 Example client setup:
 
@@ -59,8 +62,6 @@ copier.send_event(TradeEvent {
 }).await?;
 ```
 
-For production, keep the Trinity intent ID stable across process restarts so
-CopierR deduplication remains deterministic.
+Keep the Trinity intent ID stable across process restarts so CopierR deduplication remains deterministic.
 
-`UNKNOWN` must feed back into reconciliation. Do not generate a second Trinity
-intent solely because the first terminal ACK was lost.
+`UNKNOWN` must feed back into reconciliation. Do not generate a second Trinity intent solely because an external venue acknowledgement was lost.
