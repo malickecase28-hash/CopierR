@@ -3,62 +3,78 @@ journal_path = "var/copier.journal.jsonl"
 durability = "flush"
 queue_capacity = 2048
 
-# TrinityR publishes normalized execution events into CopierR.
+# cTrader Open API application credentials. Register the application with
+# cTrader/Spotware, complete OAuth for each account, and put the resulting
+# secrets/tokens in environment variables rather than this file.
+[ctrader]
+client_id_env = "CTRADER_CLIENT_ID"
+client_secret_env = "CTRADER_CLIENT_SECRET"
+# live_url = "wss://live.ctraderapi.com:5036"
+# demo_url = "wss://demo.ctraderapi.com:5036"
+
+# MetaApi is the initial terminal-free MT4/MT5 provider. CopierR can attach to
+# an existing MetaApi account ID or provision cloud access from broker login,
+# server and a password stored in an environment variable.
+[metaapi]
+auth_token_env = "METAAPI_AUTH_TOKEN"
+# provisioning_base = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai"
+
+# TrinityR/native producers still use the local low-latency agent protocol.
 [[accounts]]
 id = "trinity-master"
 platform = "trinity"
 role = "master"
+backend = "agent"
 token = "replace-trinity-token"
 allow_rebroadcast = false
 
-# MetaTrader follower. The optional terminal block lets CopierR supervise the
-# terminal process. The Rust bridge DLL inside the terminal connects back to
-# the local daemon.
+# Terminal-free MT5 follower using an already provisioned MetaApi account.
 [[accounts]]
 id = "mt5-follower-1"
 platform = "mt5"
 role = "follower"
-token = "replace-mt5-token"
+backend = "meta_api"
+allow_rebroadcast = false
 
-[accounts.terminal]
-enabled = false
-command = "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
-args = ["/portable"]
-restart_on_exit = true
-restart_delay_ms = 2000
-# egress_profile = "fixed-us-east"
+[accounts.metaapi]
+account_id = "replace-metaapi-account-id"
+region = "new-york"
+poll_interval_ms = 100
+magic = 8104811
 
+# Terminal-free MT4 follower with automatic MetaApi provisioning. Do not put
+# the trading password in this file; export MT4_FOLLOWER_PASSWORD instead.
 [[accounts]]
 id = "mt4-follower-1"
 platform = "mt4"
 role = "follower"
-token = "replace-mt4-token"
+backend = "meta_api"
+allow_rebroadcast = false
 
+[accounts.metaapi]
+login = "12345678"
+server = "Broker-MT4-Live"
+password_env = "MT4_FOLLOWER_PASSWORD"
+region = "new-york"
+poll_interval_ms = 100
+magic = 8104812
+
+# Native cTrader Open API follower. No cTrader desktop or cBot is required.
 [[accounts]]
 id = "ctrader-follower-1"
 platform = "ctrader"
 role = "follower"
-token = "replace-ctrader-token"
+backend = "c_trader_open_api"
+allow_rebroadcast = false
 
-# Fixed egress profiles are intentionally static. They are for account
-# isolation and authorized regional routing, not IP rotation.
-[egress_profiles.direct]
-mode = "direct"
-region = "local"
+[accounts.ctrader]
+ctid_trader_account_id = 12345678
+access_token_env = "CTRADER_FOLLOWER_ACCESS_TOKEN"
+environment = "live"
 
-# On Linux/Wine, create the namespace and VPN/tunnel outside CopierR, then
-# attach a supervised terminal to it with egress_profile = "fixed-us-east".
-[egress_profiles.fixed-us-east]
-mode = "network_namespace"
-namespace = "copierr-us-east"
-region = "us-east"
-
-# A proxy environment profile is also supported. MetaTrader may ignore proxy
-# environment variables depending on the terminal/broker transport.
-[egress_profiles.fixed-proxy]
-mode = "proxy_env"
-proxy_url = "socks5://127.0.0.1:1080"
-region = "us-east"
+# Direct venue accounts can also be masters or role="both". CopierR will emit
+# normalized position events from their remote state and suppress feedback for
+# positions opened by CopierR itself.
 
 [[routes]]
 id = "trinity-to-mt5"
