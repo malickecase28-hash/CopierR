@@ -1,0 +1,10 @@
+/target/
+/var/
+*.dll
+*.so
+*.dylib
+*.ex4
+*.ex5
+*.algo
+copierr.local.toml
+.DS_Store
