@@ -1,5 +1,7 @@
 use crate::config::{AccountConfig, DaemonConfig, EgressMode, EgressProfile, TerminalConfig};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+#[cfg(not(unix))]
+use anyhow::bail;
 use std::sync::Arc;
 use tokio::{process::Command, time::{sleep, Duration}};
 use tracing::{error, info, warn};
@@ -76,7 +78,10 @@ fn build_command(terminal: &TerminalConfig, profile: Option<&EgressProfile>) -> 
                 let profile = profile.expect("profile is present");
                 let namespace = profile.namespace.as_deref().unwrap_or_default();
                 let mut command = Command::new("ip");
-                command.args(["netns", "exec", namespace, &terminal.command]);
+                command.arg("netns");
+                command.arg("exec");
+                command.arg(namespace);
+                command.arg(&terminal.command);
                 command.args(&terminal.args);
                 if let Some(region) = &profile.region {
                     command.env("COPIERR_EGRESS_REGION", region);
