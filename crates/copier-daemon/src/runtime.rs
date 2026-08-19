@@ -213,6 +213,13 @@ impl AppState {
             self.runtime.lock().await.apply(&record);
             return Ok(());
         }
+        if matches!(ack.status, AckStatus::Accepted | AckStatus::Filled)
+            && command.action == TradeAction::Open
+            && ack.external_id.is_none()
+        {
+            self.mark_unknown(&command.command_id, "open acknowledgement omitted external order id").await?;
+            return Ok(());
+        }
 
         let mirror = if matches!(ack.status, AckStatus::Accepted | AckStatus::Filled) {
             self.mirror_mutation(&command, &ack).await?
@@ -230,10 +237,7 @@ impl AppState {
         let key = MirrorBinding::key(&command.source_account_id, &command.source_order_id, &command.target_account_id);
         match command.action {
             TradeAction::Open => {
-                let Some(target_order_id) = ack.external_id.clone() else {
-                    self.mark_unknown(&command.command_id, "open acknowledgement omitted external order id").await?;
-                    return Ok(None);
-                };
+                let target_order_id = ack.external_id.clone().expect("validated external id");
                 Ok(Some(MirrorMutation::Upsert {
                     binding: MirrorBinding {
                         route_id: command.route_id.clone(),
