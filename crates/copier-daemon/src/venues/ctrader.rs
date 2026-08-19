@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{sync::mpsc, time::{interval, Duration, MissedTickBehavior}};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 const APPLICATION_AUTH_REQ: i64 = 2100;
 const APPLICATION_AUTH_RES: i64 = 2101;
@@ -76,10 +76,13 @@ pub fn spawn_hub(
     let mut prepared = Vec::with_capacity(accounts.len());
     for local in accounts {
         let direct = local.ctrader.as_ref().expect("validated cTrader account config");
+        let ctid = direct.ctid_trader_account_id;
+        let access_token_env = direct.access_token_env.clone();
+        let access_token = read_secret(&access_token_env)?;
         prepared.push(HubAccount {
             local,
-            ctid: direct.ctid_trader_account_id,
-            access_token: read_secret(&direct.access_token_env)?,
+            ctid,
+            access_token,
         });
     }
     let url = match environment {
@@ -245,21 +248,34 @@ async fn handle_message(
             ("ORDER_CANCEL_REJECTED", 8), ("ORDER_PARTIAL_FILL", 11),
         ]).unwrap_or_default();
 
+        // ORDER_ACCEPTED and ORDER_PARTIAL_FILL are non-final. Keep the original
+        // durable command outstanding until cTrader reports a final outcome.
+        if matches!(execution_type, 2 | 11) {
+            if let Some(runtime) = runtimes.get_mut(&ctid) {
+                update_position_from_execution(state, runtime, &payload).await?;
+            }
+            return Ok(());
+        }
+
         if let Some((original, external_id)) = protection_pending.remove(&client_msg_id) {
-            let status = if matches!(execution_type, 3 | 4) { AckStatus::Filled } else if execution_type == 2 { AckStatus::Accepted } else { AckStatus::Unknown };
+            let status = match execution_type {
+                3 | 4 => AckStatus::Filled,
+                5 | 6 | 7 | 8 => AckStatus::Rejected,
+                _ => AckStatus::Unknown,
+            };
             let ack = ExecutionAck {
                 command_id: original.command_id.clone(),
                 account_id: original.target_account_id.clone(),
                 status,
                 external_id: Some(external_id),
                 timestamp_unix_ns: unix_time_ns(),
-                message: Some("cTrader position protection applied".to_owned()),
+                message: Some("cTrader position protection finalized".to_owned()),
             };
             state.handle_frame(&original.target_account_id, AgentFrame::Ack(ack)).await?;
         } else if let Some(command) = pending.remove(&client_msg_id) {
             let external_id = execution_external_id(&payload).or_else(|| command.target_order_id.clone());
             if command.action == TradeAction::Open
-                && matches!(execution_type, 3 | 11)
+                && matches!(execution_type, 3 | 4)
                 && (command.stop_loss.is_some() || command.take_profit.is_some())
             {
                 if let Some(position_id) = external_id.clone() {
@@ -281,9 +297,8 @@ async fn handle_message(
                 }
             } else {
                 let status = match execution_type {
-                    2 => AckStatus::Accepted,
-                    3 | 4 | 5 | 11 => AckStatus::Filled,
-                    6 | 7 | 8 => AckStatus::Rejected,
+                    3 | 4 => AckStatus::Filled,
+                    5 | 6 | 7 | 8 => AckStatus::Rejected,
                     _ => AckStatus::Unknown,
                 };
                 let ack = ExecutionAck {
