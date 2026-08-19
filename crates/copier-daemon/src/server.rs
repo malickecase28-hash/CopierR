@@ -52,26 +52,31 @@ async fn handle_connection(state: Arc<AppState>, stream: TcpStream) -> Result<()
         debug!(account = %writer_account, "writer task stopped");
     });
 
-    state.dispatch_queued_for(&account_id).await?;
+    let connection_result: Result<()> = async {
+        state.dispatch_queued_for(&account_id).await?;
 
-    let mut line = String::with_capacity(512);
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line).await?;
-        if bytes == 0 {
-            break;
-        }
-        let frame = match parse_agent_line(&line) {
-            Ok(frame) => frame,
-            Err(error) => {
-                warn!(account = %account_id, %error, "invalid agent frame");
-                continue;
+        let mut line = String::with_capacity(512);
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).await?;
+            if bytes == 0 {
+                break;
             }
-        };
-        state.handle_frame(&account_id, frame).await?;
-    }
+            let frame = match parse_agent_line(&line) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    warn!(account = %account_id, %error, "invalid agent frame");
+                    continue;
+                }
+            };
+            state.handle_frame(&account_id, frame).await?;
+        }
+        Ok(())
+    }.await;
 
     writer_task.abort();
-    state.unregister_session(&account_id, session_id).await?;
+    let cleanup_result = state.unregister_session(&account_id, session_id).await;
+    connection_result?;
+    cleanup_result?;
     Ok(())
 }
