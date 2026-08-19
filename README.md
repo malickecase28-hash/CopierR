@@ -1,66 +1,101 @@
 # CopierR
 
-CopierR is a low-latency Rust trade-copying daemon designed to run beside
-[TrinityR](https://github.com/malickecase28-hash/TrinityR). It normalizes a
-master event once, fans it out through compiled copy rules, and dispatches
-platform-specific execution commands to MT4, MT5 and cTrader terminal agents.
+CopierR is a Linux-first, headless Rust trade-copying service designed to run beside [TrinityR](https://github.com/malickecase28-hash/TrinityR). It normalizes a master event once, applies compiled copy rules, journals durable financial intent, and routes execution to platform-specific direct venues.
 
-The initial implementation is intentionally headless. There is no UI in the
-hot path.
+**CopierR v0.2 does not require MT4, MT5 or cTrader desktop applications to be installed on the CopierR host.**
 
 ## Architecture
 
 ```text
-TrinityR / master terminal
-          |
-          | normalized EVENT
-          v
-+-------------------------------+
-| CopierR                       |
-|                               |
-| auth + account registry       |
-| compiled route rules          |
-| deterministic command IDs     |
-| mirror/ticket book            |
-| append-only journal           |
-| UNKNOWN fail-closed handling  |
-+---------------+---------------+
-                |
-        localhost TCP, TCP_NODELAY
-        +-------+-------+
-        |               |
-        v               v
-  MT4 / MT5 DLL      cTrader cBot
-        |               |
-        v               v
-    terminal         terminal
-        |               |
-        +----- broker ---+
+                         TrinityR
+                            |
+                    native CopierR agent
+                            |
+                            v
++------------------------------------------------------+
+| CopierR                                              |
+|                                                      |
+| account registry + copy rules                        |
+| deterministic command IDs                            |
+| append-only journal                                  |
+| mirror / position bindings                           |
+| bounded venue queues                                 |
+| UNKNOWN fail-closed handling                         |
++----------------------+-------------------------------+
+                       |
+          +------------+-------------+
+          |                          |
+          v                          v
+  cTrader Open API              MetaApi venue
+  native WebSocket              HTTPS REST v0.2
+          |                          |
+  cTrader backend          cloud MT4 / MT5 terminals
+          |                          |
+          +------------+-------------+
+                       |
+                    brokers
 ```
 
-MT4 and MT5 use the small Rust `copierr_bridge` DLL only as a nonblocking TCP
-transport. Trading logic remains in the EA and the central Rust daemon. cTrader
-uses `TcpClient` directly from the cBot.
+The local TCP listener remains only for trusted native producers such as TrinityR. MT4/MT5 and cTrader accounts are managed internally by direct venue tasks and cannot attach through that agent listener.
+
+## Platform strategy
+
+### cTrader
+
+cTrader is connected natively from Rust through the official cTrader Open API. CopierR maintains at most one live hub and one demo hub and multiplexes configured accounts over those connections. The direct adapter handles application authentication, per-account authentication, symbol discovery, position reconciliation, heartbeats, order execution, partial closes, SL/TP changes and execution events.
+
+You need a cTrader Open API application and OAuth access token for each cTrader account. You do **not** need cTrader Desktop or a cBot on the Linux host.
+
+### MT4 / MT5
+
+MetaTrader retail accounts do not expose a generic official broker-independent raw trading protocol comparable to cTrader Open API. CopierR therefore treats MetaTrader execution as a provider abstraction.
+
+The first terminal-free provider is **MetaApi**. It can:
+
+- attach to an already provisioned MetaApi account ID;
+- or provision cloud MT4/MT5 access from broker login, server and password;
+- submit open, modify, partial-close and close operations;
+- read remote positions for master-event detection and reconciliation.
+
+No MT4/MT5 executable, Wine prefix, MQL EA or bridge DLL is required on the CopierR host. MetaApi is an external service and requires its own account/credentials.
+
+The provider boundary is intentionally isolated so broker FIX, broker REST, MetaTrader institutional APIs, or another MT4/MT5 cloud provider can be added without changing the copier core.
 
 ## Safety model
 
-CopierR follows TrinityR's production-execution direction: external outcomes
-that are uncertain are not blindly retried. A command is journaled as queued,
-then journaled as dispatched before it enters a live terminal session. If that
-session disappears before a terminal ACK, the command becomes `UNKNOWN` and is
-not replayed automatically.
+CopierR preserves the production-execution boundary used by TrinityR:
 
-Queued commands that were never dispatched are safe to send when the target
-account reconnects.
+```text
+SignalProposal
+      |
+      v
+Gamma: permission + primary sizing
+      |
+      v
+OMS / durable intent
+      |
+      v
+CopierR fan-out + follower transformation
+      |
+      v
+Venue adapter
+      |
+      v
+ACK / UNKNOWN
+      |
+      v
+Reconciliation
+```
 
-The journal also persists master-event deduplication and master-to-follower
-order bindings.
+Commands are journaled before live dispatch. If a request has an uncertain external outcome, CopierR marks it `UNKNOWN` rather than blindly retrying and risking a duplicate financial transaction. Queued commands that were never dispatched remain safe to send when a venue reconnects.
 
 ## Current copy features
 
 - one master to many followers;
-- MT4, MT5 and cTrader account types;
-- TrinityR as a native Rust master source;
+- MT4, MT5, cTrader and TrinityR account types;
+- direct cTrader Open API connectivity;
+- terminal-free MetaApi MT4/MT5 connectivity;
+- direct venue accounts can be master, follower or both;
 - mirror, fixed-lot and multiplier sizing;
 - min/max volume and volume-step normalization;
 - symbol maps plus prefix/suffix mapping;
@@ -70,105 +105,101 @@ order bindings.
 - stale-event cutoff;
 - full close, modify and proportional reduce commands;
 - deterministic command IDs and duplicate-event suppression;
-- durable ticket/position mirror bindings;
-- optional terminal process supervision;
-- fixed per-account egress profiles.
+- durable source-to-follower position bindings;
+- copied-trade feedback suppression;
+- append-only recovery journal.
 
-## Network / regional egress
+## Linux build
 
-CopierR does not rotate IPs or attempt to bypass broker controls. The terminal
-supervisor can attach an account to a fixed authorized egress path:
-
-- `direct`;
-- `proxy_env` for software that honors `ALL_PROXY` / `HTTP_PROXY` /
-  `HTTPS_PROXY`;
-- `network_namespace` on Linux/Wine, where the namespace and VPN/tunnel are
-  provisioned outside CopierR.
-
-This keeps account network identities isolated without putting VPN setup or
-rotation logic into the trade engine.
-
-## Build
-
-Rust 1.81+ is the workspace baseline.
+Rust 1.81+ remains the workspace baseline to stay aligned with TrinityR.
 
 ```bash
+git clone https://github.com/malickecase28-hash/CopierR.git
+cd CopierR
 cargo build --workspace --release
 cargo test --workspace
 ```
 
-Run the daemon:
+Prepare configuration:
 
 ```bash
 cp copierr.example.toml copierr.toml
-cargo run -p copier-daemon --release -- daemon --config copierr.toml
 ```
 
-Validate config without starting listeners or terminals:
+Validate it without connecting to any venue:
 
 ```bash
 cargo run -p copier-daemon -- validate --config copierr.toml
 ```
 
-## MT4 / MT5 bridge DLL
+Run:
 
-Build both Windows architectures because MT4 is normally 32-bit while MT5 is
-normally 64-bit:
-
-```powershell
-rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc
-cargo build -p copier-bridge-ffi --release --target i686-pc-windows-msvc
-cargo build -p copier-bridge-ffi --release --target x86_64-pc-windows-msvc
+```bash
+cargo run -p copier-daemon --release -- daemon --config copierr.toml
 ```
 
-Copy the 32-bit DLL into the MT4 `MQL4/Libraries` directory and the 64-bit DLL
-into the MT5 `MQL5/Libraries` directory. Enable DLL imports for the CopierR EA.
-The EA source lives under `bridges/mt4` and `bridges/mt5`.
+or use the built binary:
+
+```bash
+./target/release/copierr daemon --config copierr.toml
+```
+
+## Credentials
+
+Secrets are referenced by environment-variable name and are not intended to be stored in `copierr.toml`.
+
+Typical variables are:
+
+```bash
+export CTRADER_CLIENT_ID='...'
+export CTRADER_CLIENT_SECRET='...'
+export CTRADER_FOLLOWER_ACCESS_TOKEN='...'
+
+export METAAPI_AUTH_TOKEN='...'
+export MT4_FOLLOWER_PASSWORD='...'
+```
+
+See `copierr.example.toml` for complete account examples.
 
 ## TrinityR integration
 
-`copier-client` is a small async Rust client that shares CopierR's canonical
-wire contract. Add it to TrinityR as a path or Git dependency, connect with an
-account configured as `platform = "trinity"`, and submit `TradeEvent` values
-after TrinityR's permission/sizing authority has approved the intent.
+`copier-client` is the native async Rust client for the local CopierR wire protocol. Configure TrinityR as an `agent` account and publish canonical `TradeEvent` values only after TrinityR's permission and primary sizing authorities have approved the intent.
 
-See `docs/trinityr-integration.md` for the intended authority boundary.
+See `docs/trinityr-integration.md`.
 
-## Low-latency choices
+## Latency design
+
+CopierR keeps the central fan-out path compact:
 
 - one normalization pass at the master boundary;
 - immutable compiled routing table;
-- `TCP_NODELAY` on every local session;
-- bounded per-terminal queues;
-- compact tab-delimited frames rather than general-purpose broker JSON;
-- a Rust `cdylib` transport for MetaTrader instead of file polling;
-- append-only journal with configurable `none`, `flush`, or `fsync` durability;
-- no UI, database ORM, HTTP framework or cloud hop in the initial hot path.
+- deterministic command identifiers;
+- bounded in-memory venue queues;
+- `TCP_NODELAY` for the TrinityR/native-agent path;
+- one multiplexed cTrader connection per live/demo environment;
+- persistent HTTP connection pooling for the MetaApi adapter;
+- no UI, ORM or application HTTP server in the execution path;
+- configurable journal durability (`none`, `flush`, `fsync`).
 
-`durability = "none"` is suitable only for latency experiments. Use `flush` or
-`fsync` for live financial execution depending on your durability requirements.
+`durability = "none"` is for latency experiments only. Use `flush` or `fsync` according to your live durability requirements.
 
-## Initial limitations
+The cTrader path is a native persistent WebSocket. The initial MetaApi path uses synchronous REST because it maps cleanly onto CopierR's durable ACK/UNKNOWN state machine. A streaming MetaApi adapter can be added later without changing routing or journal semantics.
 
-This first cut is deliberately narrow:
+## Current limitations
 
-- market-position copying is the primary path;
-- MT4 broker-specific partial-close ticket replacement needs live broker
-  qualification;
-- MT5 netting-account scale-in semantics need dedicated reconciliation work;
-- events that arrive before an open mirror binding exists are logged and
-  skipped for that route rather than guessed;
-- no automated account-equity sizing yet;
-- no built-in VPN provisioning;
+This version deliberately fails closed where platform semantics are ambiguous:
+
+- remote scale-ins on an existing master position are detected but not inferred into a follower command yet;
+- MT5 netting semantics still need explicit reconciliation tests;
+- cTrader and MetaApi credentials must be provisioned before production use;
+- MetaApi is an external dependency for generic terminal-free MT4/MT5 access;
+- events arriving before an open mirror binding exists are not guessed;
+- no automated equity-ratio or risk-percent sizing yet;
+- no built-in VPN/IP-rotation system;
 - no UI.
 
-Before live rollout, qualify each broker/account mode in demo accounts and add
-periodic broker-state reconciliation. The daemon is designed so reconciliation
-can resolve `UNKNOWN` outcomes without weakening idempotency.
+Before live-money rollout, qualify every broker/account mode on demo accounts and add periodic full broker-state reconciliation for `UNKNOWN` resolution.
 
-## Reference research
+## Legacy terminal bridges
 
-The design was informed by public trade-copier patterns including Cascada's
-small terminal bridges plus Rust core and ejtraderCP's publisher/subscriber
-model. CopierR is an independent implementation and does not vendor those
-projects' source.
+The former MQL/cBot/Rust-DLL terminal bridge implementation has been removed from the active repository. If a future deployment specifically needs self-hosted MetaTrader terminals, that should be reintroduced as a separate provider/worker service rather than coupling Windows terminal processes to the Linux copier daemon.
