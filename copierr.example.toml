@@ -1,0 +1,95 @@
+listen = "127.0.0.1:48100"
+journal_path = "var/copier.journal.jsonl"
+durability = "flush"
+queue_capacity = 2048
+
+# TrinityR publishes normalized execution events into CopierR.
+[[accounts]]
+id = "trinity-master"
+platform = "trinity"
+role = "master"
+token = "replace-trinity-token"
+allow_rebroadcast = false
+
+# MetaTrader follower. The optional terminal block lets CopierR supervise the
+# terminal process. The Rust bridge DLL inside the terminal connects back to
+# the local daemon.
+[[accounts]]
+id = "mt5-follower-1"
+platform = "mt5"
+role = "follower"
+token = "replace-mt5-token"
+
+[accounts.terminal]
+enabled = false
+command = "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+args = ["/portable"]
+restart_on_exit = true
+restart_delay_ms = 2000
+# egress_profile = "fixed-us-east"
+
+[[accounts]]
+id = "mt4-follower-1"
+platform = "mt4"
+role = "follower"
+token = "replace-mt4-token"
+
+[[accounts]]
+id = "ctrader-follower-1"
+platform = "ctrader"
+role = "follower"
+token = "replace-ctrader-token"
+
+# Fixed egress profiles are intentionally static. They are for account
+# isolation and authorized regional routing, not IP rotation.
+[egress_profiles.direct]
+mode = "direct"
+region = "local"
+
+# On Linux/Wine, create the namespace and VPN/tunnel outside CopierR, then
+# attach a supervised terminal to it with egress_profile = "fixed-us-east".
+[egress_profiles.fixed-us-east]
+mode = "network_namespace"
+namespace = "copierr-us-east"
+region = "us-east"
+
+# A proxy environment profile is also supported. MetaTrader may ignore proxy
+# environment variables depending on the terminal/broker transport.
+[egress_profiles.fixed-proxy]
+mode = "proxy_env"
+proxy_url = "socks5://127.0.0.1:1080"
+region = "us-east"
+
+[[routes]]
+id = "trinity-to-mt5"
+source_account_id = "trinity-master"
+target_account_id = "mt5-follower-1"
+enabled = true
+sizing = "multiplier"
+size_value = 1.0
+reverse = false
+copy_sl_tp = true
+min_volume = 0.01
+max_volume = 20.0
+volume_step = 0.01
+max_event_age_ms = 5000
+symbol_suffix = ""
+allow_symbols = ["XAUUSD", "EURUSD"]
+
+[routes.symbol_map]
+XAUUSD = "XAUUSD"
+EURUSD = "EURUSD"
+
+[[routes]]
+id = "trinity-to-ctrader"
+source_account_id = "trinity-master"
+target_account_id = "ctrader-follower-1"
+enabled = true
+sizing = "mirror"
+size_value = 1.0
+reverse = false
+copy_sl_tp = true
+min_volume = 0.01
+max_volume = 20.0
+volume_step = 0.01
+max_event_age_ms = 5000
