@@ -1,4 +1,4 @@
-use crate::runtime::{unix_time_ns, AppState};
+use crate::{config::AccountBackend, runtime::{unix_time_ns, AppState}};
 use anyhow::{Context, Result};
 use copier_core::{encode_server_frame, parse_agent_line, AgentFrame, ServerFrame};
 use std::sync::Arc;
@@ -32,6 +32,11 @@ async fn handle_connection(state: Arc<AppState>, stream: TcpStream) -> Result<()
         AgentFrame::Hello(hello) => hello,
         _ => anyhow::bail!("first frame must be HELLO"),
     };
+    let account = state.config.account(&hello.account_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown account {}", hello.account_id))?;
+    if account.backend != AccountBackend::Agent {
+        anyhow::bail!("account {} is managed by an internal direct venue and cannot attach over TCP", hello.account_id);
+    }
     state.authenticate(&hello.account_id, hello.platform, &hello.token)?;
 
     writer.write_all(encode_server_frame(&ServerFrame::Welcome {
