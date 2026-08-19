@@ -28,7 +28,7 @@ pub enum ServerFrame {
 }
 
 pub fn parse_agent_line(line: &str) -> Result<AgentFrame, WireError> {
-    let fields: Vec<&str> = line.trim_end_matches(['\r', '\n']).split('\t').collect();
+    let fields: Vec<&str> = strip_line_end(line).split('\t').collect();
     let kind = fields.first().copied().ok_or(WireError::Empty)?;
     match kind {
         "HELLO" => {
@@ -84,7 +84,7 @@ pub fn parse_agent_line(line: &str) -> Result<AgentFrame, WireError> {
 }
 
 pub fn parse_server_line(line: &str) -> Result<ServerFrame, WireError> {
-    let fields: Vec<&str> = line.trim_end_matches(['\r', '\n']).split('\t').collect();
+    let fields: Vec<&str> = strip_line_end(line).split('\t').collect();
     let kind = fields.first().copied().ok_or(WireError::Empty)?;
     match kind {
         "WELCOME" => {
@@ -214,6 +214,10 @@ pub fn encode_server_frame(frame: &ServerFrame) -> String {
     }
 }
 
+fn strip_line_end(value: &str) -> &str {
+    value.trim_end_matches(|ch| ch == '\r' || ch == '\n')
+}
+
 fn require_len(fields: &[&str], expected: usize, kind: &str) -> Result<(), WireError> {
     if fields.len() == expected {
         Ok(())
@@ -278,7 +282,7 @@ fn parse_i64(value: &str, field: &'static str) -> Result<i64, WireError> {
 }
 
 fn field(value: &str) -> String {
-    value.replace(['\t', '\r', '\n'], " ")
+    value.replace('\t', " ").replace('\r', " ").replace('\n', " ")
 }
 
 fn opt_str(value: Option<&str>) -> String {
