@@ -1,8 +1,8 @@
 mod config;
 mod journal;
-mod launcher;
 mod runtime;
 mod server;
+mod venues;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -14,7 +14,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "copierr", version, about = "Low-latency multi-account trade copier daemon")]
+#[command(name = "copierr", version, about = "Linux-first low-latency multi-account trade copier")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
             let config = Arc::new(DaemonConfig::load(config)?);
             let (journal, replay) = Journal::open(config.journal_path.clone(), config.durability).await?;
             let state = Arc::new(AppState::new(config.clone(), Arc::new(journal), replay)?);
-            launcher::spawn_configured_terminals(config);
+            venues::spawn(state.clone())?;
             tokio::select! {
                 result = server::run(state) => result?,
                 _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),

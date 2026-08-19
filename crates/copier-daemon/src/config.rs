@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use copier_core::{CopyEngine, Platform, RouteRule};
 use serde::Deserialize;
-use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}};
+use std::{collections::HashSet, fs, path::{Path, PathBuf}};
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -12,9 +12,7 @@ pub enum AccountRole {
 }
 
 impl Default for AccountRole {
-    fn default() -> Self {
-        Self::Both
-    }
+    fn default() -> Self { Self::Both }
 }
 
 impl AccountRole {
@@ -32,52 +30,75 @@ pub enum Durability {
 }
 
 impl Default for Durability {
-    fn default() -> Self {
-        Self::Flush
-    }
+    fn default() -> Self { Self::Flush }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum EgressMode {
-    Direct,
-    ProxyEnv,
-    NetworkNamespace,
+pub enum AccountBackend {
+    Agent,
+    CTraderOpenApi,
+    MetaApi,
 }
 
-impl Default for EgressMode {
-    fn default() -> Self {
-        Self::Direct
-    }
+impl Default for AccountBackend {
+    fn default() -> Self { Self::Agent }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct EgressProfile {
-    #[serde(default)]
-    pub mode: EgressMode,
-    #[serde(default)]
-    pub region: Option<String>,
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-    #[serde(default)]
-    pub namespace: Option<String>,
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CTraderEnvironment {
+    Live,
+    Demo,
+}
+
+impl Default for CTraderEnvironment {
+    fn default() -> Self { Self::Live }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TerminalConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    pub command: String,
+pub struct CTraderGlobalConfig {
+    pub client_id_env: String,
+    pub client_secret_env: String,
+    #[serde(default = "default_ctrader_live_url")]
+    pub live_url: String,
+    #[serde(default = "default_ctrader_demo_url")]
+    pub demo_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CTraderAccountConfig {
+    pub ctid_trader_account_id: i64,
+    pub access_token_env: String,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub environment: CTraderEnvironment,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetaApiGlobalConfig {
+    pub auth_token_env: String,
+    #[serde(default = "default_metaapi_provisioning_base")]
+    pub provisioning_base: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetaApiAccountConfig {
     #[serde(default)]
-    pub working_dir: Option<PathBuf>,
+    pub account_id: Option<String>,
     #[serde(default)]
-    pub egress_profile: Option<String>,
+    pub login: Option<String>,
     #[serde(default)]
-    pub restart_on_exit: bool,
-    #[serde(default = "default_restart_delay_ms")]
-    pub restart_delay_ms: u64,
+    pub server: Option<String>,
+    #[serde(default)]
+    pub password_env: Option<String>,
+    #[serde(default = "default_metaapi_region")]
+    pub region: String,
+    #[serde(default)]
+    pub api_base: Option<String>,
+    #[serde(default = "default_metaapi_poll_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_magic")]
+    pub magic: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,11 +107,16 @@ pub struct AccountConfig {
     pub platform: Platform,
     #[serde(default)]
     pub role: AccountRole,
-    pub token: String,
+    #[serde(default)]
+    pub backend: AccountBackend,
+    #[serde(default)]
+    pub token: Option<String>,
     #[serde(default)]
     pub allow_rebroadcast: bool,
     #[serde(default)]
-    pub terminal: Option<TerminalConfig>,
+    pub ctrader: Option<CTraderAccountConfig>,
+    #[serde(default)]
+    pub metaapi: Option<MetaApiAccountConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,7 +134,9 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub routes: Vec<RouteRule>,
     #[serde(default)]
-    pub egress_profiles: HashMap<String, EgressProfile>,
+    pub ctrader: Option<CTraderGlobalConfig>,
+    #[serde(default)]
+    pub metaapi: Option<MetaApiGlobalConfig>,
 }
 
 impl DaemonConfig {
@@ -128,22 +156,50 @@ impl DaemonConfig {
         }
         let mut ids = HashSet::new();
         for account in &self.accounts {
-            if account.id.is_empty() {
+            if account.id.trim().is_empty() {
                 bail!("account id may not be empty");
-            }
-            if account.token.is_empty() {
-                bail!("account {} has an empty token", account.id);
             }
             if !ids.insert(account.id.clone()) {
                 bail!("duplicate account id: {}", account.id);
             }
-            if let Some(terminal) = &account.terminal {
-                if terminal.enabled && terminal.command.is_empty() {
-                    bail!("account {} has an empty terminal command", account.id);
+            match account.backend {
+                AccountBackend::Agent => {
+                    if account.token.as_deref().unwrap_or("").is_empty() {
+                        bail!("agent account {} requires token", account.id);
+                    }
                 }
-                if let Some(profile) = &terminal.egress_profile {
-                    if !self.egress_profiles.contains_key(profile) {
-                        bail!("account {} references unknown egress profile {}", account.id, profile);
+                AccountBackend::CTraderOpenApi => {
+                    if account.platform != Platform::CTrader {
+                        bail!("cTrader Open API account {} must use platform=ctrader", account.id);
+                    }
+                    if self.ctrader.is_none() {
+                        bail!("cTrader Open API account {} requires global [ctrader] config", account.id);
+                    }
+                    let direct = account.ctrader.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("account {} requires ctrader settings", account.id))?;
+                    if direct.ctid_trader_account_id <= 0 || direct.access_token_env.trim().is_empty() {
+                        bail!("account {} has invalid cTrader direct settings", account.id);
+                    }
+                }
+                AccountBackend::MetaApi => {
+                    if !matches!(account.platform, Platform::Mt4 | Platform::Mt5) {
+                        bail!("MetaApi account {} must use platform=mt4 or platform=mt5", account.id);
+                    }
+                    if self.metaapi.is_none() {
+                        bail!("MetaApi account {} requires global [metaapi] config", account.id);
+                    }
+                    let direct = account.metaapi.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("account {} requires metaapi settings", account.id))?;
+                    if direct.poll_interval_ms < 25 {
+                        bail!("account {} metaapi poll_interval_ms must be at least 25", account.id);
+                    }
+                    if direct.account_id.as_deref().unwrap_or("").is_empty() {
+                        if direct.login.as_deref().unwrap_or("").is_empty()
+                            || direct.server.as_deref().unwrap_or("").is_empty()
+                            || direct.password_env.as_deref().unwrap_or("").is_empty()
+                        {
+                            bail!("account {} needs metaapi.account_id or login/server/password_env for provisioning", account.id);
+                        }
                     }
                 }
             }
@@ -157,16 +213,14 @@ impl DaemonConfig {
             }
         }
         CopyEngine::new(self.routes.clone()).context("invalid routing configuration")?;
-        for (name, profile) in &self.egress_profiles {
-            match profile.mode {
-                EgressMode::Direct => {}
-                EgressMode::ProxyEnv if profile.proxy_url.as_deref().unwrap_or("").is_empty() => {
-                    bail!("egress profile {name} requires proxy_url");
-                }
-                EgressMode::NetworkNamespace if profile.namespace.as_deref().unwrap_or("").is_empty() => {
-                    bail!("egress profile {name} requires namespace");
-                }
-                _ => {}
+        if let Some(ctrader) = &self.ctrader {
+            if ctrader.client_id_env.trim().is_empty() || ctrader.client_secret_env.trim().is_empty() {
+                bail!("ctrader client credential environment variable names may not be empty");
+            }
+        }
+        if let Some(metaapi) = &self.metaapi {
+            if metaapi.auth_token_env.trim().is_empty() {
+                bail!("metaapi auth_token_env may not be empty");
             }
         }
         Ok(())
@@ -177,8 +231,21 @@ impl DaemonConfig {
     }
 }
 
-fn default_true() -> bool { true }
-fn default_restart_delay_ms() -> u64 { 2_000 }
+pub fn read_secret(env_name: &str) -> Result<String> {
+    let value = std::env::var(env_name)
+        .with_context(|| format!("required environment variable {env_name} is not set"))?;
+    if value.is_empty() {
+        bail!("required environment variable {env_name} is empty");
+    }
+    Ok(value)
+}
+
 fn default_queue_capacity() -> usize { 2_048 }
 fn default_listen() -> String { "127.0.0.1:48100".to_owned() }
 fn default_journal_path() -> PathBuf { PathBuf::from("var/copier.journal.jsonl") }
+fn default_ctrader_live_url() -> String { "wss://live.ctraderapi.com:5036".to_owned() }
+fn default_ctrader_demo_url() -> String { "wss://demo.ctraderapi.com:5036".to_owned() }
+fn default_metaapi_provisioning_base() -> String { "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai".to_owned() }
+fn default_metaapi_region() -> String { "new-york".to_owned() }
+fn default_metaapi_poll_ms() -> u64 { 100 }
+fn default_magic() -> u64 { 8_104_811 }
