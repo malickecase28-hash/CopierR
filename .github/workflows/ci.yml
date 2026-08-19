@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  rust:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,14 +14,4 @@ jobs:
           toolchain: 1.81.0
       - run: cargo check --workspace
       - run: cargo test --workspace
-
-  windows-bridge:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.81.0
-          targets: i686-pc-windows-msvc,x86_64-pc-windows-msvc
-      - run: cargo build -p copier-bridge-ffi --release --target i686-pc-windows-msvc
-      - run: cargo build -p copier-bridge-ffi --release --target x86_64-pc-windows-msvc
+      - run: cargo build --workspace --release

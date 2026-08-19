@@ -4,7 +4,6 @@ members = [
     "crates/copier-core",
     "crates/copier-daemon",
     "crates/copier-client",
-    "crates/copier-bridge-ffi",
 ]
 default-members = [
     "crates/copier-core",
@@ -13,24 +12,27 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.81"
 authors = ["CopierR"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/malickecase28-hash/CopierR"
-description = "Low-latency multi-account trade-copying daemon for TrinityR"
+description = "Linux-first low-latency multi-account trade-copying service for TrinityR"
 
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "=4.5.23", features = ["derive"] }
+futures-util = "=0.3.31"
 hashbrown = "=0.15.5"
 indexmap = "=2.11.4"
+reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs", "process"] }
+tokio-tungstenite = { version = "=0.21.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
