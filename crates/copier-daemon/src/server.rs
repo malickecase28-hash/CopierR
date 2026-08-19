@@ -68,20 +68,10 @@ async fn handle_connection(state: Arc<AppState>, stream: TcpStream) -> Result<()
                 continue;
             }
         };
-        if matches!(frame, AgentFrame::Ping(_)) {
-            if let Some(session) = state_session_sender(&state, &account_id).await {
-                let _ = session.send(ServerFrame::Pong { server_time_unix_ns: unix_time_ns() }).await;
-            }
-            continue;
-        }
         state.handle_frame(&account_id, frame).await?;
     }
 
     writer_task.abort();
     state.unregister_session(&account_id, session_id).await?;
     Ok(())
-}
-
-async fn state_session_sender(state: &Arc<AppState>, account_id: &str) -> Option<mpsc::Sender<ServerFrame>> {
-    state.session_sender(account_id).await
 }
