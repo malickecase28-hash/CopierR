@@ -136,7 +136,13 @@ async fn ensure_account(
             .send()
             .await
             .context("MetaApi provisioning request failed")?;
-        if response.status().is_success() {
+        let status = response.status();
+        if status == StatusCode::ACCEPTED {
+            debug!(account = %account.id, attempt, "MetaApi provisioning still in progress");
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        if status.is_success() {
             let value: Value = response.json().await.context("invalid MetaApi provisioning response")?;
             if let Some(id) = value.get("id").and_then(Value::as_str) {
                 info!(account = %account.id, provider_account = %id, "MetaApi account provisioned");
@@ -144,12 +150,6 @@ async fn ensure_account(
             }
             bail!("MetaApi provisioning response did not include account id");
         }
-        if response.status() == StatusCode::ACCEPTED {
-            debug!(account = %account.id, attempt, "MetaApi provisioning still in progress");
-            sleep(Duration::from_secs(5)).await;
-            continue;
-        }
-        let status = response.status();
         let body = response.text().await.unwrap_or_default();
         bail!("MetaApi provisioning failed with {status}: {body}");
     }
