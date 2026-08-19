@@ -110,7 +110,7 @@ pub struct AccountConfig {
     #[serde(default)]
     pub backend: AccountBackend,
     #[serde(default)]
-    pub token: Option<String>,
+    pub token: String,
     #[serde(default)]
     pub allow_rebroadcast: bool,
     #[serde(default)]
@@ -164,7 +164,7 @@ impl DaemonConfig {
             }
             match account.backend {
                 AccountBackend::Agent => {
-                    if account.token.as_deref().unwrap_or("").is_empty() {
+                    if account.token.is_empty() {
                         bail!("agent account {} requires token", account.id);
                     }
                 }
