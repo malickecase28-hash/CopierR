@@ -66,6 +66,11 @@ impl RouteRule {
         if self.sizing != SizingMode::Mirror && self.size_value <= 0.0 {
             return Err(RouteError::InvalidVolumePolicy(self.id.clone()));
         }
+        if self.symbol_map.iter().any(|(source, target)| {
+            source.trim().is_empty() || target.trim().is_empty()
+        }) {
+            return Err(RouteError::InvalidSymbolMap(self.id.clone()));
+        }
         Ok(())
     }
 
@@ -257,4 +262,6 @@ pub enum RouteError {
     MissingMirror(String),
     #[error("mirror binding is invalid for route: {0}")]
     InvalidMirror(String),
+    #[error("symbol map contains an empty source or target on route: {0}")]
+    InvalidSymbolMap(String),
 }

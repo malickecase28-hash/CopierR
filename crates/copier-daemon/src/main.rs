@@ -2,6 +2,7 @@ mod config;
 mod journal;
 mod runtime;
 mod server;
+mod ui;
 mod venues;
 
 use anyhow::Result;
@@ -30,6 +31,10 @@ enum Command {
         #[arg(short, long, default_value = "copierr.toml")]
         config: PathBuf,
     },
+    Ui {
+        #[arg(short, long, default_value = "127.0.0.1:48200")]
+        listen: String,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -54,6 +59,7 @@ async fn main() -> Result<()> {
                 _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
             }
         }
+        Command::Ui { listen } => ui::run(&listen).await?,
     }
     Ok(())
 }

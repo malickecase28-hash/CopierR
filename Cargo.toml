@@ -22,6 +22,7 @@ description = "Linux-first low-latency multi-account trade-copying service for T
 
 [workspace.dependencies]
 anyhow = "1"
+axum = "=0.7.9"
 clap = { version = "=4.5.23", features = ["derive"] }
 futures-util = "=0.3.31"
 hashbrown = "=0.15.5"

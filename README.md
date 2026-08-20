@@ -132,6 +132,26 @@ Validate it without connecting to any venue:
 cargo run -p copier-daemon -- validate --config copierr.toml
 ```
 
+## Local test UI
+
+CopierR includes a local control room for configuring demo master/follower
+accounts, routes, symbol maps, and daemon lifecycle:
+
+```bash
+cargo run -p copier-daemon -- ui
+```
+
+Open `http://127.0.0.1:48200/`. The UI validates and writes the generated TOML,
+then launches the daemon from the same executable. Secret values are kept in
+memory by the UI and injected into the daemon process; they are not written to
+the generated config file. Use `symbol_map` entries such as
+`EURUSD = EURUSD.a` when broker symbol names differ.
+
+The first live-provider test should use one MetaApi MT5 demo account as a
+master and one cTrader demo account as a follower. Start the daemon before
+opening a new source position so the initial broker snapshot is treated as the
+baseline.
+
 Run:
 
 ```bash

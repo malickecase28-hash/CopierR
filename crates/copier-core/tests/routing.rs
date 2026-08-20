@@ -79,3 +79,10 @@ fn reduce_scales_from_original_mirror_ratio() {
     assert_eq!(command.target_order_id.as_deref(), Some("900"));
     assert_eq!(command.volume, 0.5);
 }
+
+#[test]
+fn rejects_empty_symbol_map_entries() {
+    let mut invalid = route();
+    invalid.symbol_map.insert("".into(), "EURUSD".into());
+    assert!(CopyEngine::new(vec![invalid]).is_err());
+}

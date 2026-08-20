@@ -1,4 +1,4 @@
-use crate::{config::DaemonConfig, journal::{Journal, JournalRecord, MirrorMutation, ReplayState, StoredCommandState}};
+use crate::{config::{read_secret, DaemonConfig}, journal::{Journal, JournalRecord, MirrorMutation, ReplayState, StoredCommandState}};
 use anyhow::{bail, Result};
 use copier_core::{AckStatus, AgentFrame, CopyEngine, ExecutionAck, ExecutionCommand, MirrorBinding, ServerFrame, TradeAction, TradeEvent};
 use std::{collections::HashMap, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
@@ -38,7 +38,11 @@ impl AppState {
         if account.platform != platform {
             bail!("platform mismatch for account {account_id}");
         }
-        if account.token != token {
+        let expected_token = match account.token_env.as_deref() {
+            Some(token_env) if !token_env.trim().is_empty() => read_secret(token_env)?,
+            _ => account.token.clone(),
+        };
+        if expected_token != token {
             bail!("invalid token for account {account_id}");
         }
         Ok(())

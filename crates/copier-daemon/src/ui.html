@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CopierR Control Room</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0a0e16; --panel:#121a27; --line:#26344a; --text:#e7edf7; --muted:#93a4bc; --accent:#65d8ad; --warn:#f5b95c; --danger:#f47676; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 10% 0%,#14273a 0,#0a0e16 38rem); color:var(--text); font:14px/1.45 Inter,Segoe UI,system-ui,sans-serif; }
+    main { max-width:1280px; margin:0 auto; padding:28px 20px 64px; }
+    header { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:22px; }
+    h1,h2,h3,p { margin:0; } h1 { font-size:30px; letter-spacing:-.04em; } h2 { font-size:17px; } h3 { font-size:14px; color:var(--accent); }
+    .eyebrow { color:var(--accent); font-size:11px; font-weight:700; letter-spacing:.16em; text-transform:uppercase; margin-bottom:6px; }
+    .muted { color:var(--muted); } .warning { color:var(--warn); } .status { display:flex; align-items:center; gap:8px; white-space:nowrap; color:var(--muted); }
+    .dot { width:10px; height:10px; border-radius:99px; background:#65748a; box-shadow:0 0 0 4px #65748a22; } .dot.on { background:var(--accent); box-shadow:0 0 0 4px #65d8ad22; } .dot.err { background:var(--danger); }
+    .panel { background:linear-gradient(145deg,#151f2e,#101722); border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:16px; box-shadow:0 16px 40px #0002; }
+    .panel-head { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:14px; } .panel-head p { margin-top:4px; }
+    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; } .grid.two { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    label { display:flex; flex-direction:column; gap:6px; color:var(--muted); font-size:12px; font-weight:600; }
+    input,select,textarea { width:100%; border:1px solid #304058; border-radius:8px; background:#0c131e; color:var(--text); padding:9px 10px; font:inherit; }
+    input:focus,select:focus,textarea:focus { outline:2px solid #65d8ad66; border-color:var(--accent); } textarea { min-height:82px; resize:vertical; }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:12px; } .card { border:1px solid var(--line); border-radius:11px; padding:14px; background:#0d141f; }
+    .card-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; } .card-head strong { color:var(--text); }
+    .account-extra { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); } .check { flex-direction:row; align-items:center; gap:8px; padding-top:25px; } .check input { width:auto; }
+    button { border:1px solid #35516a; border-radius:8px; padding:9px 13px; background:#162638; color:var(--text); cursor:pointer; font-weight:700; } button:hover { border-color:var(--accent); background:#1c3541; }
+    button.primary { background:var(--accent); color:#092018; border-color:var(--accent); } button.danger { color:#ffd4d4; border-color:#713d4b; background:#321a27; } button.small { padding:6px 9px; font-size:12px; }
+    .actions { display:flex; flex-wrap:wrap; gap:9px; align-items:center; } .spacer { flex:1; }
+    pre { margin:0; max-height:300px; overflow:auto; padding:13px; border-radius:9px; background:#080c13; color:#b9c9dd; white-space:pre-wrap; word-break:break-word; }
+    .route-map { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; } .hint { font-size:12px; color:var(--muted); margin-top:7px; }
+    @media (max-width:800px) { header { flex-direction:column; } .grid,.grid.two { grid-template-columns:1fr 1fr; } }
+    @media (max-width:520px) { main { padding:18px 12px 45px; } .grid,.grid.two { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><div class="eyebrow">Local control room</div><h1>CopierR</h1><p class="muted">Configure routes, preview symbol translation, and launch a test daemon.</p></div>
+    <div class="status"><span id="status-dot" class="dot"></span><span id="status-text">Daemon stopped</span></div>
+  </header>
+
+  <section class="panel">
+    <div class="panel-head"><div><h2>Run settings</h2><p class="muted">The generated TOML is saved locally. Secret values stay in memory and are passed only to the child process.</p></div></div>
+    <div class="grid">
+      <label>Config file<input id="config-path" value="copierr.test.toml"></label>
+      <label>Working directory<input id="working-dir" value="."></label>
+      <label>Daemon listen address<input id="listen" value="127.0.0.1:48100"></label>
+      <label>Journal path<input id="journal-path" value="var/copier-test.journal.jsonl"></label>
+      <label>Durability<select id="durability"><option value="fsync">fsync</option><option value="flush">flush</option><option value="none">none</option></select></label>
+      <label>Queue capacity<input id="queue-capacity" type="number" min="1" value="2048"></label>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><div><h2>Provider credentials</h2><p class="muted">Use demo credentials while testing. Values marked memory-only are never written to the config file.</p></div></div>
+    <div class="grid two">
+      <div><h3>MetaApi</h3><div class="grid two">
+        <label>Auth env name<input id="meta-auth-env" value="METAAPI_AUTH_TOKEN"></label>
+        <label>Auth token · memory only<input id="meta-auth-secret" type="password" placeholder="paste locally"></label>
+        <label>Provisioning base<input id="meta-provisioning-base" value="https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai"></label>
+      </div></div>
+      <div><h3>cTrader Open API</h3><div class="grid two">
+        <label>Client ID env<input id="ctrader-client-env" value="CTRADER_CLIENT_ID"></label>
+        <label>Client ID · memory only<input id="ctrader-client-secret" type="password" placeholder="paste locally"></label>
+        <label>Client secret env<input id="ctrader-secret-env" value="CTRADER_CLIENT_SECRET"></label>
+        <label>Client secret · memory only<input id="ctrader-secret-value" type="password" placeholder="paste locally"></label>
+        <label>Live WebSocket URL<input id="ctrader-live-url" value="wss://live.ctraderapi.com:5036"></label>
+        <label>Demo WebSocket URL<input id="ctrader-demo-url" value="wss://demo.ctraderapi.com:5036"></label>
+      </div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><div><h2>Accounts</h2><p class="muted">Set one account to master/both and the other to follower. Direct MT5 accounts use MetaApi; direct cTrader accounts use Open API.</p></div><button id="add-account" class="small">+ Add account</button></div>
+    <div id="accounts" class="cards"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><div><h2>Routes and symbol maps</h2><p class="muted">Map the exact source symbol to the broker’s target symbol, one per line: <code>EURUSD=EURUSD.a</code></p></div><button id="add-route" class="small">+ Add route</button></div>
+    <div id="routes" class="cards"></div>
+  </section>
+
+  <section class="panel">
+    <div class="actions">
+      <button id="validate">Validate configuration</button><button id="start" class="primary">Save and start daemon</button><button id="stop" class="danger">Stop daemon</button><span class="spacer"></span><span class="warning">Demo accounts only until every action is qualified.</span>
+    </div>
+  </section>
+  <section class="panel"><div class="panel-head"><div><h2>Output and daemon log</h2><p class="muted">The last 200 daemon lines are kept in this local UI process.</p></div></div><pre id="output">Ready.</pre></section>
+</main>
+<script>
+const state = {
+  accounts: [
+    {id:'mt5-master',platform:'mt5',role:'master',backend:'meta_api',allow_rebroadcast:false,token_env:'',token_secret:'',metaapi:{account_id:'',login:'',server:'',password_env:'',password_secret:'',region:'new-york',api_base:'',poll_interval_ms:100,magic:8104811},ctrader:{ctid_trader_account_id:0,access_token_env:'',access_token_secret:'',environment:'demo'}},
+    {id:'ctrader-follower',platform:'ctrader',role:'follower',backend:'c_trader_open_api',allow_rebroadcast:false,token_env:'',token_secret:'',metaapi:{account_id:'',login:'',server:'',password_env:'',password_secret:'',region:'new-york',api_base:'',poll_interval_ms:100,magic:8104812},ctrader:{ctid_trader_account_id:0,access_token_env:'CTRADER_DEMO_ACCESS_TOKEN',access_token_secret:'',environment:'demo'}}
+  ],
+  routes: [{id:'mt5-to-ctrader',source_account_id:'mt5-master',target_account_id:'ctrader-follower',enabled:true,sizing:'mirror',size_value:1,reverse:false,copy_sl_tp:true,min_volume:.01,max_volume:1,volume_step:.01,max_event_age_ms:5000,allow_symbols:[],deny_symbols:[],symbol_prefix:'',symbol_suffix:'',symbol_map_text:''}]
+};
+const $ = id => document.getElementById(id);
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const field = (id,label,value,type='text') => '<label>'+label+'<input id="'+id+'" type="'+type+'" value="'+esc(value)+'"></label>';
+const select = (id,label,value,options) => '<label>'+label+'<select id="'+id+'">'+options.map(v => '<option value="'+v+'" '+(v===value?'selected':'')+'>'+v+'</option>').join('')+'</select></label>';
+const check = (id,label,value) => '<label class="check"><input id="'+id+'" type="checkbox" '+(value?'checked':'')+'>'+label+'</label>';
+const val = id => $(id)?.value ?? '';
+const num = id => Number(val(id) || 0);
+const on = id => $(id)?.checked ?? false;
+function mapText(map) { return Object.entries(map || {}).map(([a,b]) => a+'='+b).join('\\n'); }
+function parseMap(text) { const out={}; String(text||'').split(/\\r?\\n/).forEach(line=>{ line=line.trim(); if(!line||line.startsWith('#')) return; const p=line.split(/\\s*(?:=|->)\\s*/); if(p.length===2&&p[0].trim()&&p[1].trim()) out[p[0].trim()]=p[1].trim(); }); return out; }
+function renderAccounts() {
+  $('accounts').innerHTML = state.accounts.map((a,i) => {
+    const prefix='acc-'+i+'-';
+    let extra='';
+    if(a.backend==='meta_api') extra='<div class="account-extra"><h3>MetaApi account</h3><div class="grid two">'+field(prefix+'account-id','Existing MetaApi account ID',a.metaapi.account_id)+field(prefix+'login','Broker login',a.metaapi.login)+field(prefix+'server','Broker server',a.metaapi.server)+field(prefix+'password-env','Password env name',a.metaapi.password_env)+field(prefix+'password-secret','Password · memory only',a.metaapi.password_secret,'password')+field(prefix+'region','Region',a.metaapi.region)+field(prefix+'api-base','Custom API base',a.metaapi.api_base)+field(prefix+'poll','Poll interval ms',a.metaapi.poll_interval_ms,'number')+field(prefix+'magic','Magic number',a.metaapi.magic,'number')+'</div><p class="hint">Use an existing MetaApi account ID, or leave it blank and provide login/server/password env for provisioning.</p></div>';
+    if(a.backend==='c_trader_open_api') extra='<div class="account-extra"><h3>cTrader account</h3><div class="grid two">'+field(prefix+'ctid','cTID trader account ID',a.ctrader.ctid_trader_account_id,'number')+field(prefix+'access-env','Access token env name',a.ctrader.access_token_env)+field(prefix+'access-secret','Access token · memory only',a.ctrader.access_token_secret,'password')+select(prefix+'environment','Environment',a.ctrader.environment,['demo','live'])+'</div></div>';
+    if(a.backend==='agent') extra='<div class="account-extra"><h3>Native agent</h3><div class="grid two">'+field(prefix+'agent-token-env','Token env name',a.token_env)+field(prefix+'agent-token-secret','Token · memory only',a.token_secret,'password')+'</div></div>';
+    return '<article class="card"><div class="card-head"><strong>Account '+(i+1)+'</strong><button class="small danger remove-account" data-index="'+i+'">Remove</button></div><div class="grid two">'+field(prefix+'id','Account ID',a.id)+select(prefix+'platform','Platform',a.platform,['trinity','mt4','mt5','ctrader'])+select(prefix+'role','Role',a.role,['master','follower','both'])+select(prefix+'backend','Backend',a.backend,['agent','meta_api','c_trader_open_api'])+check(prefix+'rebroadcast','Allow rebroadcast',a.allow_rebroadcast)+'</div>'+extra+'</article>';
+  }).join('');
+}
+function renderRoutes() {
+  $('routes').innerHTML = state.routes.map((r,i) => {
+    const p='route-'+i+'-';
+    return '<article class="card"><div class="card-head"><strong>Route '+(i+1)+'</strong><button class="small danger remove-route" data-index="'+i+'">Remove</button></div><div class="grid two">'+field(p+'id','Route ID',r.id)+field(p+'source','Source account',r.source_account_id)+field(p+'target','Target account',r.target_account_id)+select(p+'sizing','Sizing',r.sizing,['mirror','fixed','multiplier'])+field(p+'size','Size value',r.size_value,'number')+field(p+'min','Min volume',r.min_volume,'number')+field(p+'max','Max volume',r.max_volume,'number')+field(p+'step','Volume step',r.volume_step,'number')+field(p+'age','Max event age ms',r.max_event_age_ms,'number')+field(p+'prefix','Symbol prefix',r.symbol_prefix)+field(p+'suffix','Symbol suffix',r.symbol_suffix)+field(p+'allow','Allow symbols, comma separated',r.allow_symbols.join(', '))+field(p+'deny','Deny symbols, comma separated',r.deny_symbols.join(', '))+check(p+'enabled','Enabled',r.enabled)+check(p+'reverse','Reverse side',r.reverse)+check(p+'sltp','Copy SL/TP',r.copy_sl_tp)+'</div><label class="hint">Exact symbol map<textarea class="route-map" id="'+p+'map" placeholder="EURUSD=EURUSD.a\\nXAUUSD=XAUUSD.r">'+esc(r.symbol_map_text)+'</textarea></label><p class="hint">Leave blank when names match. Prefix/suffix apply only when a source symbol has no explicit map entry.</p></article>';
+  }).join('');
+}
+function sync() {
+  state.accounts = state.accounts.map((a,i) => { const p='acc-'+i+'-'; const n={...a,id:val(p+'id'),platform:val(p+'platform'),role:val(p+'role'),backend:val(p+'backend'),allow_rebroadcast:on(p+'rebroadcast')}; n.token_env=val(p+'agent-token-env'); n.token_secret=val(p+'agent-token-secret'); n.metaapi={account_id:val(p+'account-id'),login:val(p+'login'),server:val(p+'server'),password_env:val(p+'password-env'),password_secret:val(p+'password-secret'),region:val(p+'region'),api_base:val(p+'api-base'),poll_interval_ms:num(p+'poll'),magic:num(p+'magic')}; n.ctrader={ctid_trader_account_id:num(p+'ctid'),access_token_env:val(p+'access-env'),access_token_secret:val(p+'access-secret'),environment:val(p+'environment')}; return n; });
+  state.routes = state.routes.map((r,i) => { const p='route-'+i+'-'; return {...r,id:val(p+'id'),source_account_id:val(p+'source'),target_account_id:val(p+'target'),sizing:val(p+'sizing'),size_value:num(p+'size'),min_volume:num(p+'min'),max_volume:num(p+'max'),volume_step:num(p+'step'),max_event_age_ms:num(p+'age'),symbol_prefix:val(p+'prefix'),symbol_suffix:val(p+'suffix'),allow_symbols:val(p+'allow').split(',').map(x=>x.trim()).filter(Boolean),deny_symbols:val(p+'deny').split(',').map(x=>x.trim()).filter(Boolean),enabled:on(p+'enabled'),reverse:on(p+'reverse'),copy_sl_tp:on(p+'sltp'),symbol_map_text:val(p+'map')}; });
+}
+function request() {
+  sync(); const secrets={}; const put=(name,value)=>{if(name&&value) secrets[name]=value;};
+  put(val('meta-auth-env'),val('meta-auth-secret')); put(val('ctrader-client-env'),val('ctrader-client-secret')); put(val('ctrader-secret-env'),val('ctrader-secret-value'));
+  const accounts=state.accounts.map(a=>{put(a.token_env,a.token_secret);put(a.metaapi.password_env,a.metaapi.password_secret);put(a.ctrader.access_token_env,a.ctrader.access_token_secret);const out={...a}; delete out.token_secret; out.token=''; delete out.metaapi.password_secret; delete out.ctrader.access_token_secret; out.metaapi={...out.metaapi}; delete out.metaapi.password_secret; out.ctrader={...out.ctrader}; delete out.ctrader.access_token_secret; return out;});
+  const config={listen:val('listen'),journal_path:val('journal-path'),durability:val('durability'),queue_capacity:num('queue-capacity'),accounts,routes:state.routes.map(r=>{const out={...r,symbol_map:parseMap(r.symbol_map_text)};delete out.symbol_map_text;return out;}),metaapi:{auth_token_env:val('meta-auth-env'),provisioning_base:val('meta-provisioning-base')},ctrader:{client_id_env:val('ctrader-client-env'),client_secret_env:val('ctrader-secret-env'),live_url:val('ctrader-live-url'),demo_url:val('ctrader-demo-url')}}; return {config,config_path:val('config-path'),working_dir:val('working-dir'),secrets}; }
+async function api(path,body) { const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const data=await response.json(); if(!response.ok) throw new Error(data.message||'Request failed'); return data; }
+function output(value) { $('output').textContent=typeof value==='string'?value:JSON.stringify(value,null,2); }
+async function refresh() { try { const r=await fetch('/api/status'); const s=await r.json(); $('status-dot').className='dot '+(s.running?'on':''); $('status-text').textContent=s.running?'Daemon running'+(s.pid?' · pid '+s.pid:''):'Daemon stopped'; if(s.logs.length) $('output').textContent=s.logs.join('\\n'); } catch(e) { $('status-dot').className='dot err'; $('status-text').textContent='UI connection error'; } }
+$('add-account').onclick=()=>{sync();state.accounts.push({id:'new-account',platform:'mt5',role:'follower',backend:'meta_api',allow_rebroadcast:false,token_env:'',token_secret:'',metaapi:{account_id:'',login:'',server:'',password_env:'',password_secret:'',region:'new-york',api_base:'',poll_interval_ms:100,magic:8104811},ctrader:{ctid_trader_account_id:0,access_token_env:'',access_token_secret:'',environment:'demo'}});renderAccounts();};
+$('add-route').onclick=()=>{sync();state.routes.push({id:'new-route',source_account_id:'',target_account_id:'',enabled:true,sizing:'mirror',size_value:1,reverse:false,copy_sl_tp:true,min_volume:.01,max_volume:1,volume_step:.01,max_event_age_ms:5000,allow_symbols:[],deny_symbols:[],symbol_prefix:'',symbol_suffix:'',symbol_map_text:''});renderRoutes();};
+document.addEventListener('click',e=>{if(e.target.classList.contains('remove-account')){sync();state.accounts.splice(Number(e.target.dataset.index),1);renderAccounts();}if(e.target.classList.contains('remove-route')){sync();state.routes.splice(Number(e.target.dataset.index),1);renderRoutes();}});
+document.addEventListener('change',e=>{if(e.target.id&&e.target.id.match(/^acc-\\d+-backend$/)){sync();renderAccounts();}});
+$('validate').onclick=async()=>{try{const r=await api('/api/validate',request());output(r.message+'\\n\\n'+r.toml);}catch(e){output('Validation error: '+e.message);}};
+$('start').onclick=async()=>{try{output('Saving configuration and starting daemon...');const r=await api('/api/start',request());output(r.message);await refresh();}catch(e){output('Start error: '+e.message);}};
+$('stop').onclick=async()=>{try{const r=await api('/api/stop',{});output(r.message);await refresh();}catch(e){output('Stop error: '+e.message);}};
+renderAccounts();renderRoutes();refresh();setInterval(refresh,2000);
+</script>
+</body>
+</html>

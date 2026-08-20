@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
 use copier_core::{CopyEngine, Platform, RouteRule};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs, path::{Path, PathBuf}};
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountRole {
     Master,
@@ -18,7 +18,7 @@ impl AccountRole {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
     None,
@@ -27,7 +27,7 @@ pub enum Durability {
     Fsync,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountBackend {
     #[default]
@@ -36,7 +36,7 @@ pub enum AccountBackend {
     MetaApi,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CTraderEnvironment {
     #[default]
@@ -44,7 +44,7 @@ pub enum CTraderEnvironment {
     Demo,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CTraderGlobalConfig {
     pub client_id_env: String,
     pub client_secret_env: String,
@@ -54,7 +54,7 @@ pub struct CTraderGlobalConfig {
     pub demo_url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CTraderAccountConfig {
     pub ctid_trader_account_id: i64,
     pub access_token_env: String,
@@ -62,14 +62,14 @@ pub struct CTraderAccountConfig {
     pub environment: CTraderEnvironment,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MetaApiGlobalConfig {
     pub auth_token_env: String,
     #[serde(default = "default_metaapi_provisioning_base")]
     pub provisioning_base: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MetaApiAccountConfig {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -89,7 +89,7 @@ pub struct MetaApiAccountConfig {
     pub magic: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountConfig {
     pub id: String,
     pub platform: Platform,
@@ -100,6 +100,8 @@ pub struct AccountConfig {
     #[serde(default)]
     pub token: String,
     #[serde(default)]
+    pub token_env: Option<String>,
+    #[serde(default)]
     pub allow_rebroadcast: bool,
     #[serde(default)]
     pub ctrader: Option<CTraderAccountConfig>,
@@ -107,7 +109,7 @@ pub struct AccountConfig {
     pub metaapi: Option<MetaApiAccountConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -152,8 +154,10 @@ impl DaemonConfig {
             }
             match account.backend {
                 AccountBackend::Agent => {
-                    if account.token.is_empty() {
-                        bail!("agent account {} requires token", account.id);
+                    if account.token.is_empty()
+                        && account.token_env.as_deref().unwrap_or("").trim().is_empty()
+                    {
+                        bail!("agent account {} requires token or token_env", account.id);
                     }
                 }
                 AccountBackend::CTraderOpenApi => {

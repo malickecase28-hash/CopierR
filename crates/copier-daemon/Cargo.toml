@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 copier-core = { path = "../copier-core" }
 anyhow = { workspace = true }
+axum = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 hashbrown = { workspace = true }
