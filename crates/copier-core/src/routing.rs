@@ -4,9 +4,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SizingMode {
+    #[default]
     Mirror,
     Fixed,
     Multiplier,
@@ -49,12 +50,6 @@ pub struct RouteRule {
     pub symbol_suffix: String,
     #[serde(default)]
     pub max_event_age_ms: u64,
-}
-
-impl Default for SizingMode {
-    fn default() -> Self {
-        Self::Mirror
-    }
 }
 
 impl RouteRule {

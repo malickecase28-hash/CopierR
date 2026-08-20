@@ -8,6 +8,7 @@ pub enum Platform {
     Trinity,
     Mt4,
     Mt5,
+    #[serde(rename = "ctrader", alias = "c_trader")]
     CTrader,
 }
 

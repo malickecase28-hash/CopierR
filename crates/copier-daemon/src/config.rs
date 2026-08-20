@@ -3,16 +3,13 @@ use copier_core::{CopyEngine, Platform, RouteRule};
 use serde::Deserialize;
 use std::{collections::HashSet, fs, path::{Path, PathBuf}};
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountRole {
     Master,
     Follower,
+    #[default]
     Both,
-}
-
-impl Default for AccountRole {
-    fn default() -> Self { Self::Both }
 }
 
 impl AccountRole {
@@ -21,39 +18,30 @@ impl AccountRole {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
     None,
+    #[default]
     Flush,
     Fsync,
 }
 
-impl Default for Durability {
-    fn default() -> Self { Self::Flush }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountBackend {
+    #[default]
     Agent,
     CTraderOpenApi,
     MetaApi,
 }
 
-impl Default for AccountBackend {
-    fn default() -> Self { Self::Agent }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CTraderEnvironment {
+    #[default]
     Live,
     Demo,
-}
-
-impl Default for CTraderEnvironment {
-    fn default() -> Self { Self::Live }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -193,13 +181,12 @@ impl DaemonConfig {
                     if direct.poll_interval_ms < 25 {
                         bail!("account {} metaapi poll_interval_ms must be at least 25", account.id);
                     }
-                    if direct.account_id.as_deref().unwrap_or("").is_empty() {
-                        if direct.login.as_deref().unwrap_or("").is_empty()
+                    if direct.account_id.as_deref().unwrap_or("").is_empty()
+                        && (direct.login.as_deref().unwrap_or("").is_empty()
                             || direct.server.as_deref().unwrap_or("").is_empty()
-                            || direct.password_env.as_deref().unwrap_or("").is_empty()
-                        {
-                            bail!("account {} needs metaapi.account_id or login/server/password_env for provisioning", account.id);
-                        }
+                            || direct.password_env.as_deref().unwrap_or("").is_empty())
+                    {
+                        bail!("account {} needs metaapi.account_id or login/server/password_env for provisioning", account.id);
                     }
                 }
             }

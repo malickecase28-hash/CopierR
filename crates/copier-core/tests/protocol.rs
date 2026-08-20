@@ -1,4 +1,7 @@
-use copier_core::{encode_agent_frame, parse_agent_line, AgentFrame, Platform, Side, TradeAction, TradeEvent};
+use copier_core::{
+    encode_agent_frame, parse_agent_line, AgentFrame, Platform, Side, TradeAction, TradeEvent,
+};
+use serde_json::json;
 
 #[test]
 fn event_wire_roundtrip() {
@@ -21,4 +24,17 @@ fn event_wire_roundtrip() {
     let encoded = encode_agent_frame(&AgentFrame::Event(event.clone()));
     let decoded = parse_agent_line(&encoded).expect("wire frame parses");
     assert_eq!(decoded, AgentFrame::Event(event));
+}
+
+#[test]
+fn ctrader_accepts_documented_config_name_and_legacy_alias() {
+    assert_eq!(
+        serde_json::from_value::<Platform>(json!("ctrader")).unwrap(),
+        Platform::CTrader
+    );
+    assert_eq!(
+        serde_json::from_value::<Platform>(json!("c_trader")).unwrap(),
+        Platform::CTrader
+    );
+    assert_eq!(serde_json::to_value(Platform::CTrader).unwrap(), json!("ctrader"));
 }

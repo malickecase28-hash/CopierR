@@ -22,7 +22,7 @@ pub enum AgentFrame {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerFrame {
     Welcome { server_time_unix_ns: i64 },
-    Command(ExecutionCommand),
+    Command(Box<ExecutionCommand>),
     Error { code: String, message: String },
     Pong { server_time_unix_ns: i64 },
 }
@@ -97,7 +97,7 @@ pub fn parse_server_line(line: &str) -> Result<ServerFrame, WireError> {
         "COMMAND" => {
             require_len(&fields, 18, "COMMAND")?;
             require_version(fields[1])?;
-            Ok(ServerFrame::Command(ExecutionCommand {
+            Ok(ServerFrame::Command(Box::new(ExecutionCommand {
                 command_id: required(fields[2], "command_id")?.to_owned(),
                 origin_event_id: required(fields[3], "origin_event_id")?.to_owned(),
                 route_id: required(fields[4], "route_id")?.to_owned(),
@@ -115,7 +115,7 @@ pub fn parse_server_line(line: &str) -> Result<ServerFrame, WireError> {
                 stop_loss: parse_opt_f64(fields[16], "stop_loss")?,
                 take_profit: parse_opt_f64(fields[17], "take_profit")?,
                 created_unix_ns: 0,
-            }))
+            })))
         }
         "ERROR" => {
             require_len(&fields, 4, "ERROR")?;
@@ -215,7 +215,7 @@ pub fn encode_server_frame(frame: &ServerFrame) -> String {
 }
 
 fn strip_line_end(value: &str) -> &str {
-    value.trim_end_matches(|ch| ch == '\r' || ch == '\n')
+    value.trim_end_matches(['\r', '\n'])
 }
 
 fn require_len(fields: &[&str], expected: usize, kind: &str) -> Result<(), WireError> {
@@ -282,7 +282,7 @@ fn parse_i64(value: &str, field: &'static str) -> Result<i64, WireError> {
 }
 
 fn field(value: &str) -> String {
-    value.replace('\t', " ").replace('\r', " ").replace('\n', " ")
+    value.replace(['\t', '\r', '\n'], " ")
 }
 
 fn opt_str(value: Option<&str>) -> String {

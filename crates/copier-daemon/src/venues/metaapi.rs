@@ -72,7 +72,7 @@ pub async fn run_account(
                 maybe_frame = rx.recv() => {
                     let Some(frame) = maybe_frame else { break; };
                     if let ServerFrame::Command(command) = frame {
-                        let ack = execute(&client, &api_base, &provider_account_id, &auth_token, direct.magic, command).await;
+                        let ack = execute(&client, &api_base, &provider_account_id, &auth_token, direct.magic, *command).await;
                         state.handle_frame(&account.id, AgentFrame::Ack(ack)).await?;
                     }
                 }
@@ -317,10 +317,8 @@ fn value_to_string(value: &Value) -> Option<String> {
         Some(value.to_owned())
     } else if let Some(value) = value.as_i64() {
         Some(value.to_string())
-    } else if let Some(value) = value.as_u64() {
-        Some(value.to_string())
     } else {
-        None
+        value.as_u64().map(|value| value.to_string())
     }
 }
 

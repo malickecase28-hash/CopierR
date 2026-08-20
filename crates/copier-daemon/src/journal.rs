@@ -43,7 +43,7 @@ pub enum JournalRecord {
     },
     AckApplied {
         ack: ExecutionAck,
-        mirror: Option<MirrorMutation>,
+        mirror: Box<Option<MirrorMutation>>,
     },
 }
 
@@ -84,7 +84,7 @@ impl ReplayState {
                 } else {
                     self.commands.remove(&ack.command_id);
                 }
-                if let Some(mutation) = mirror {
+                if let Some(mutation) = mirror.as_ref() {
                     match mutation {
                         MirrorMutation::Upsert { binding } => {
                             self.mirrors.insert(binding.binding_key(), binding.clone());

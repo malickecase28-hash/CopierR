@@ -176,7 +176,7 @@ impl AppState {
             let mut runtime = self.runtime.lock().await;
             runtime.apply(&dispatched);
         }
-        if session.tx.send(ServerFrame::Command(command.clone())).await.is_err() {
+        if session.tx.send(ServerFrame::Command(Box::new(command.clone()))).await.is_err() {
             self.mark_unknown(&command.command_id, "session queue closed before write").await?;
         }
         Ok(())
@@ -208,7 +208,10 @@ impl AppState {
             bail!("ack target does not match command target");
         }
         if ack.status == AckStatus::Unknown {
-            let record = JournalRecord::AckApplied { ack, mirror: None };
+            let record = JournalRecord::AckApplied {
+                ack,
+                mirror: Box::new(None),
+            };
             self.journal.append(&record).await?;
             self.runtime.lock().await.apply(&record);
             return Ok(());
@@ -226,7 +229,10 @@ impl AppState {
         } else {
             None
         };
-        let record = JournalRecord::AckApplied { ack: ack.clone(), mirror };
+        let record = JournalRecord::AckApplied {
+            ack: ack.clone(),
+            mirror: Box::new(mirror),
+        };
         self.journal.append(&record).await?;
         self.runtime.lock().await.apply(&record);
         info!(command_id = %ack.command_id, account = %ack.account_id, status = %ack.status, "terminal acknowledgement applied");

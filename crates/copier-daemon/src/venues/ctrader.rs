@@ -153,7 +153,7 @@ async fn run_hub(
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 if let ServerFrame::Command(command) = frame {
-                    if forward.send(command).await.is_err() {
+                    if forward.send(*command).await.is_err() {
                         break;
                     }
                 }
@@ -260,7 +260,7 @@ async fn handle_message(
         if let Some((original, external_id)) = protection_pending.remove(&client_msg_id) {
             let status = match execution_type {
                 3 | 4 => AckStatus::Filled,
-                5 | 6 | 7 | 8 => AckStatus::Rejected,
+                5..=8 => AckStatus::Rejected,
                 _ => AckStatus::Unknown,
             };
             let ack = ExecutionAck {
@@ -298,7 +298,7 @@ async fn handle_message(
             } else {
                 let status = match execution_type {
                     3 | 4 => AckStatus::Filled,
-                    5 | 6 | 7 | 8 => AckStatus::Rejected,
+                    5..=8 => AckStatus::Rejected,
                     _ => AckStatus::Unknown,
                 };
                 let ack = ExecutionAck {
