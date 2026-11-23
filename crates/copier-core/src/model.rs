@@ -81,6 +81,20 @@ pub enum TradeAction {
     Modify,
     Reduce,
     Close,
+    PlaceLimit,
+    PlaceStop,
+    AmendPending,
+    CancelPending,
+}
+
+impl TradeAction {
+    pub fn adds_exposure(self) -> bool {
+        matches!(self, Self::Open | Self::PlaceLimit | Self::PlaceStop)
+    }
+
+    pub fn is_pending(self) -> bool {
+        matches!(self, Self::PlaceLimit | Self::PlaceStop | Self::AmendPending | Self::CancelPending)
+    }
 }
 
 impl fmt::Display for TradeAction {
@@ -90,6 +104,10 @@ impl fmt::Display for TradeAction {
             Self::Modify => "modify",
             Self::Reduce => "reduce",
             Self::Close => "close",
+            Self::PlaceLimit => "place_limit",
+            Self::PlaceStop => "place_stop",
+            Self::AmendPending => "amend_pending",
+            Self::CancelPending => "cancel_pending",
         })
     }
 }
@@ -103,6 +121,10 @@ impl FromStr for TradeAction {
             "modify" => Ok(Self::Modify),
             "reduce" | "partial_close" => Ok(Self::Reduce),
             "close" => Ok(Self::Close),
+            "place_limit" => Ok(Self::PlaceLimit),
+            "place_stop" => Ok(Self::PlaceStop),
+            "amend_pending" => Ok(Self::AmendPending),
+            "cancel_pending" => Ok(Self::CancelPending),
             _ => Err(ModelError::InvalidAction(value.to_owned())),
         }
     }
@@ -140,14 +162,34 @@ impl TradeEvent {
         if self.symbol.is_empty() {
             return Err(ModelError::Missing("symbol"));
         }
-        if matches!(self.action, TradeAction::Open | TradeAction::Reduce) && self.volume <= 0.0 {
+        if !self.volume.is_finite() || self.volume < 0.0
+            || ((self.action.adds_exposure() || self.action == TradeAction::Reduce) && self.volume == 0.0)
+        {
             return Err(ModelError::InvalidVolume(self.volume));
         }
-        if self.action == TradeAction::Open && self.side.is_none() {
+        for value in [self.remaining_volume, self.price, self.stop_loss, self.take_profit].into_iter().flatten() {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ModelError::InvalidNumber(value));
+            }
+        }
+        if self.action.adds_exposure() && self.side.is_none() {
             return Err(ModelError::Missing("side"));
+        }
+        if self.action.is_pending() && self.action != TradeAction::CancelPending && !self.price.is_some_and(|price| price > 0.0) {
+            return Err(ModelError::Missing("pending order price"));
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrokerPosition {
+    pub id: String,
+    pub lots: f64,
+    #[serde(default)]
+    pub copier_managed: bool,
+    #[serde(default)]
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -256,4 +298,6 @@ pub enum ModelError {
     InvalidAckStatus(String),
     #[error("invalid volume: {0}")]
     InvalidVolume(f64),
+    #[error("invalid numeric trade attribute: {0}")]
+    InvalidNumber(f64),
 }

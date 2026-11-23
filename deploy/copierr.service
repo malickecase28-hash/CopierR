@@ -1,0 +1,24 @@
+[Unit]
+Description=CopierR trade-copying daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/var/lib/copierr
+StateDirectory=copierr
+StateDirectoryMode=0700
+EnvironmentFile=/etc/copierr/copierr.env
+ExecStartPre=/opt/copierr/current/copierr validate --config /etc/copierr/copierr.toml
+ExecStart=/opt/copierr/current/copierr daemon --config /etc/copierr/copierr.toml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -30,6 +30,10 @@ impl CopierClient {
         self.send_frame(&AgentFrame::Ack(ack)).await
     }
 
+    pub async fn send_snapshot(&mut self, positions: Vec<copier_core::BrokerPosition>) -> Result<(), ClientError> {
+        self.send_frame(&AgentFrame::Snapshot(positions)).await
+    }
+
     pub async fn ping(&mut self, timestamp_unix_ns: i64) -> Result<(), ClientError> {
         self.send_frame(&AgentFrame::Ping(timestamp_unix_ns)).await
     }

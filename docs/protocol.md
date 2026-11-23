@@ -13,6 +13,7 @@ Every terminal/client must send `HELLO` before any other frame.
 HELLO  1  account_id  platform  token
 EVENT  1  event_id  account_id  platform  action  source_order_id  symbol  side  volume  remaining_volume  price  sl  tp  timestamp_unix_ns  origin_command_id
 ACK    1  command_id  account_id  status  external_id  timestamp_unix_ns  message
+SNAPSHOT  1  json_exposure_array
 PING   1  timestamp_unix_ns
 ```
 
@@ -21,6 +22,18 @@ The separators above are literal TAB bytes.
 Platforms: `trinity`, `mt4`, `mt5`, `ctrader`.
 
 Actions: `open`, `modify`, `reduce`, `close`.
+
+Routes listed in `pending_routes` also accept `place_limit`, `place_stop`,
+`amend_pending` and `cancel_pending`. Placements return a broker pending-order
+ID in `external_id`, and subsequent pending changes use that same target ID.
+Placement and amendment carry an absolute trigger in `price`.
+
+An agent can report all positions and pending commitments for its account
+with `SNAPSHOT`. Send it initially, after executions and periodically before
+the 15-second freshness window expires. Follower risk and pending dispatch
+require a fresh snapshot. An empty array indicates an empty account. Each
+entry is a JSON object with `id`, `lots`, optional `pending` and optional
+`copier_managed`, both defaulting to `false`.
 
 Sides: `buy`, `sell`, or empty when the action does not require direction.
 

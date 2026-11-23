@@ -3,15 +3,61 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
     steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git python3
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.81.0
+      - run: cargo test --locked --workspace
+      - run: cargo build --release --locked -p copier-daemon
+      - run: python3 tests/smoke_brokers.py target/release/copierr
+      - name: Package Debian 13 x86-64 release
+        shell: bash
+        run: |
+          version="$(target/release/copierr --version | awk '{print $2}')"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Release tag must match the workspace version v$version" >&2
+            exit 1
+          fi
+          name="copierr-v${version}-debian13-x86_64"
+          mkdir -p "dist/$name"
+          install -m 0755 target/release/copierr "dist/$name/copierr"
+          install -m 0644 deploy/copierr.service copierr.example.toml docs/architecture.md docs/protocol.md docs/references.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
         with:
-          toolchain: 1.81.0
-      - run: cargo check --workspace
-      - run: cargo test --workspace
-      - run: cargo build --workspace --release
+          name: copierr-debian13-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: copierr-debian13-x86_64
+          path: dist
+      - name: Publish a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum -c ./*.sha256)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes

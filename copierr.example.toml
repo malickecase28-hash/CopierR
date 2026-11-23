@@ -1,7 +1,22 @@
+# Plain TCP: keep the agent port on loopback. Remote agents connect through an SSH or Tailscale tunnel; binding a tunnel address
+# instead needs allow_remote_agents = true.
 listen = "127.0.0.1:48100"
 journal_path = "var/copier.journal.jsonl"
-durability = "flush"
+durability = "fsync"
 queue_capacity = 2048
+backlog_capacity = 10000
+checkpoint_interval_secs = 3600
+# Requires stable producer timestamps across retries.
+# event_retention_secs = 604800
+# ops_listen = "127.0.0.1:48101"
+# ops_token_env = "COPIERR_OPS_TOKEN"
+# alerts_url_env = "COPIERR_ALERTS_URL"
+# alerts_token_env = "COPIERR_ALERTS_TOKEN"
+# pending_routes = ["route-id"]
+
+# [follower_risk.mt5-follower-1]
+# max_open_positions = 8
+# max_total_lots = 2.0
 
 # cTrader Open API application credentials. Register the application with
 # cTrader/Spotware, complete OAuth for each account, and put the resulting
@@ -25,7 +40,7 @@ id = "trinity-master"
 platform = "trinity"
 role = "master"
 backend = "agent"
-token = "replace-trinity-token"
+token_env = "COPIERR_TRINITY_TOKEN"   # the agent token lives in copierr.env, not here
 allow_rebroadcast = false
 
 # Terminal-free MT5 follower using an already provisioned MetaApi account.

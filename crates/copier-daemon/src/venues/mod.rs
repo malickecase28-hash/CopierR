@@ -4,7 +4,8 @@ mod metaapi;
 use crate::{config::{read_secret, AccountBackend, CTraderEnvironment}, runtime::AppState};
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::error;
+use tokio::time::{sleep, Duration};
+use tracing::warn;
 
 pub fn spawn(state: Arc<AppState>) -> Result<()> {
     let mut ctrader_live = Vec::new();
@@ -25,8 +26,12 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                 let auth_token = read_secret(&global.auth_token_env)?;
                 let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = metaapi::run_account(state, account, global, auth_token).await {
-                        error!(error = %err, "MetaApi venue stopped");
+                    let mut delay = ReconnectDelay::default();
+                    loop {
+                        let started = std::time::Instant::now();
+                        let result = metaapi::run_account(state.clone(), account.clone(), global.clone(), auth_token.clone()).await;
+                        warn!(account = %account.id, error = ?result.err(), "MetaApi venue disconnected; reconnecting");
+                        delay.wait(started.elapsed()).await;
                     }
                 });
             }
@@ -40,4 +45,14 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
         ctrader::spawn_hub(state, CTraderEnvironment::Demo, ctrader_demo)?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct ReconnectDelay(u64);
+
+impl ReconnectDelay {
+    async fn wait(&mut self, uptime: Duration) {
+        self.0 = if uptime >= Duration::from_secs(60) { 1 } else { (self.0 * 2).clamp(1, 30) };
+        sleep(Duration::from_secs(self.0)).await;
+    }
 }

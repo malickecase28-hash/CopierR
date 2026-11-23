@@ -65,3 +65,5 @@ copier.send_event(TradeEvent {
 Keep the Trinity intent ID stable across process restarts so CopierR deduplication remains deterministic.
 
 `UNKNOWN` must feed back into reconciliation. Do not generate a second Trinity intent solely because an external venue acknowledgement was lost.
+
+Use the [authenticated operations contract](architecture.md#trinity-operations-contract) to pause dispatch, surface alerts, and resolve broker outcomes. This boundary is independent of the Trinity administration UI. Direct account snapshots come from the broker adapters. A follower using the TCP adapter can publish snapshots through `CopierClient::send_snapshot`.

@@ -1,8 +1,10 @@
 # CopierR
 
+See the [CopierR 2.0 architecture and operations guide](docs/architecture.md) for recovery, pending orders, follower risk, the Trinity API and the Linux release.
+
 CopierR is a Linux-first, headless Rust trade-copying service designed to run beside [TrinityR](https://github.com/malickecase28-hash/TrinityR). It normalizes a master event once, applies compiled copy rules, journals durable financial intent, and routes execution to platform-specific direct venues.
 
-**CopierR v0.2 does not require MT4, MT5 or cTrader desktop applications to be installed on the CopierR host.**
+**CopierR 2.0 runs without MT4, MT5 or cTrader desktop applications on the CopierR host.**
 
 ## Architecture
 
@@ -27,7 +29,7 @@ CopierR is a Linux-first, headless Rust trade-copying service designed to run be
           |                          |
           v                          v
   cTrader Open API              MetaApi venue
-  native WebSocket              HTTPS REST v0.2
+  native WebSocket              HTTPS REST
           |                          |
   cTrader backend          cloud MT4 / MT5 terminals
           |                          |
@@ -207,18 +209,17 @@ The cTrader path is a native persistent WebSocket. The initial MetaApi path uses
 
 ## Current limitations
 
-This version deliberately fails closed where platform semantics are ambiguous:
+The demo qualification checklist covers these boundaries:
 
 - remote scale-ins on an existing master position are detected but not inferred into a follower command yet;
 - MT5 netting semantics still need explicit reconciliation tests;
 - cTrader and MetaApi credentials must be provisioned before production use;
 - MetaApi is an external dependency for generic terminal-free MT4/MT5 access;
-- events arriving before an open mirror binding exists are not guessed;
+- position events wait for an outstanding open to complete before using its follower identifier;
 - no automated equity-ratio or risk-percent sizing yet;
-- no built-in VPN/IP-rotation system;
-- no UI.
+- Trinity owns ongoing administration, and CopierR includes a local test UI.
 
-Before live-money rollout, qualify every broker/account mode on demo accounts and add periodic full broker-state reconciliation for `UNKNOWN` resolution.
+Before live rollout, qualify every broker and account mode on demo accounts. The [operations guide](docs/architecture.md) covers periodic reconciliation and the process for resolving `UNKNOWN` outcomes.
 
 ## Legacy terminal bridges
 

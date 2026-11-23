@@ -5,7 +5,7 @@ pub mod protocol;
 pub mod routing;
 
 pub use model::{
-    AckStatus, ExecutionAck, ExecutionCommand, MirrorBinding, ModelError, Platform, Side,
+    AckStatus, BrokerPosition, ExecutionAck, ExecutionCommand, MirrorBinding, ModelError, Platform, Side,
     TradeAction, TradeEvent,
 };
 pub use protocol::{

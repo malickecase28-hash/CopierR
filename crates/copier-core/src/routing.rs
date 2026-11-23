@@ -60,10 +60,13 @@ impl RouteRule {
         if self.source_account_id == self.target_account_id {
             return Err(RouteError::SelfRoute(self.id.clone()));
         }
-        if self.max_volume <= 0.0 || self.volume_step <= 0.0 || self.min_volume < 0.0 {
+        if !self.max_volume.is_finite() || !self.volume_step.is_finite() || !self.min_volume.is_finite()
+            || self.max_volume <= 0.0 || self.volume_step <= 0.0 || self.min_volume < 0.0
+            || self.max_volume < self.min_volume
+        {
             return Err(RouteError::InvalidVolumePolicy(self.id.clone()));
         }
-        if self.sizing != SizingMode::Mirror && self.size_value <= 0.0 {
+        if self.sizing != SizingMode::Mirror && (!self.size_value.is_finite() || self.size_value <= 0.0) {
             return Err(RouteError::InvalidVolumePolicy(self.id.clone()));
         }
         if self.symbol_map.iter().any(|(source, target)| {
@@ -74,7 +77,10 @@ impl RouteRule {
         Ok(())
     }
 
-    fn allows(&self, event: &TradeEvent) -> bool {
+    /// Whether this route takes on new exposure from the event (an open or a pending placement). Changes to exposure the route
+    /// already copied (modify, reduce, close, amend, cancel) are never filtered: switching a route off, narrowing its symbols or
+    /// sides must not leave its open copies without their closes.
+    fn allows_new(&self, event: &TradeEvent) -> bool {
         if !self.enabled {
             return false;
         }
@@ -108,12 +114,22 @@ impl RouteRule {
     }
 
     fn normalize_open_volume(&self, raw: f64) -> f64 {
-        let clamped = raw.clamp(self.min_volume, self.max_volume);
-        normalize_step(clamped, self.volume_step)
+        // Below the route minimum the open is refused, never raised to the minimum: a 0.1x copy of 0.05 lots (0.005) opening at a
+        // 0.01 minimum is twice the intended size. Above the maximum it is capped (the route's own explicit limit).
+        if !raw.is_finite() || raw <= 0.0 || raw + 1e-9 < self.min_volume {
+            return 0.0;
+        }
+        let rounded = normalize_step(raw.min(self.max_volume), self.volume_step);
+        if rounded > self.max_volume {
+            let capped = normalize_step((self.max_volume / self.volume_step).floor() * self.volume_step, self.volume_step);
+            return if capped >= self.min_volume && capped <= self.max_volume { capped } else { 0.0 };
+        }
+        if rounded < self.min_volume { 0.0 } else { rounded }
     }
 
     fn normalize_reduce_volume(&self, raw: f64, remaining: f64) -> f64 {
-        normalize_step(raw.min(remaining).max(0.0), self.volume_step)
+        let rounded = normalize_step(raw.min(remaining).max(0.0), self.volume_step);
+        if rounded <= remaining { rounded } else { 0.0 }
     }
 }
 
@@ -149,10 +165,13 @@ impl CopyEngine {
         mirror: Option<&MirrorBinding>,
         now_unix_ns: i64,
     ) -> Result<Option<ExecutionCommand>, RouteError> {
-        if !route.allows(event) {
+        if event.action.adds_exposure() && !route.allows_new(event) {
             return Ok(None);
         }
-        if route.max_event_age_ms > 0 {
+        if event.action == TradeAction::Modify && !route.copy_sl_tp {
+            return Ok(None);
+        }
+        if route.max_event_age_ms > 0 && event.action.adds_exposure() {
             let age_ns = now_unix_ns.saturating_sub(event.timestamp_unix_ns).max(0) as u64;
             if age_ns > route.max_event_age_ms.saturating_mul(1_000_000) {
                 return Ok(None);
@@ -160,9 +179,16 @@ impl CopyEngine {
         }
 
         let side = event.side.map(|side| if route.reverse { side.reversed() } else { side });
+        // A reversed copy trades the other side, so the source's stop is the copy's target and the other way round: a buy at 100 with
+        // a stop at 95 and a target at 110 becomes a sell with its stop at 110 and its target at 95.
+        let (stop_loss, take_profit) = match (route.copy_sl_tp, route.reverse) {
+            (false, _) => (None, None),
+            (true, false) => (event.stop_loss, event.take_profit),
+            (true, true) => (event.take_profit, event.stop_loss),
+        };
         let (target_order_id, volume) = match event.action {
-            TradeAction::Open => (None, route.open_volume(event.volume)),
-            TradeAction::Modify => {
+            TradeAction::Open | TradeAction::PlaceLimit | TradeAction::PlaceStop => (None, route.open_volume(event.volume)),
+            TradeAction::Modify | TradeAction::AmendPending => {
                 let binding = mirror.ok_or_else(|| RouteError::MissingMirror(route.id.clone()))?;
                 (Some(binding.target_order_id.clone()), binding.target_remaining_volume)
             }
@@ -178,13 +204,13 @@ impl CopyEngine {
                     route.normalize_reduce_volume(target_reduce, binding.target_remaining_volume),
                 )
             }
-            TradeAction::Close => {
+            TradeAction::Close | TradeAction::CancelPending => {
                 let binding = mirror.ok_or_else(|| RouteError::MissingMirror(route.id.clone()))?;
                 (Some(binding.target_order_id.clone()), binding.target_remaining_volume)
             }
         };
 
-        if matches!(event.action, TradeAction::Open | TradeAction::Reduce) && volume <= 0.0 {
+        if (event.action.adds_exposure() || event.action == TradeAction::Reduce) && (volume <= 0.0 || !volume.is_finite()) {
             return Ok(None);
         }
 
@@ -203,8 +229,8 @@ impl CopyEngine {
             source_volume: event.volume,
             source_remaining_volume: event.remaining_volume,
             price: event.price,
-            stop_loss: route.copy_sl_tp.then_some(event.stop_loss).flatten(),
-            take_profit: route.copy_sl_tp.then_some(event.take_profit).flatten(),
+            stop_loss,
+            take_profit,
             created_unix_ns: now_unix_ns,
         }))
     }

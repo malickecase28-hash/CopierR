@@ -1,5 +1,6 @@
 mod config;
 mod journal;
+mod ops;
 mod runtime;
 mod server;
 mod ui;
@@ -53,13 +54,34 @@ async fn main() -> Result<()> {
             let config = Arc::new(DaemonConfig::load(config)?);
             let (journal, replay) = Journal::open(config.journal_path.clone(), config.durability).await?;
             let state = Arc::new(AppState::new(config.clone(), Arc::new(journal), replay)?);
+            let listener = server::bind(&state).await?;
+            let operations = ops::bind(state.clone()).await?;
+            let notifications = ops::notifications(state.clone())?;
             venues::spawn(state.clone())?;
             tokio::select! {
-                result = server::run(state) => result?,
-                _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
+                result = server::run(state.clone(), listener) => result?,
+                result = operations => result?,
+                result = notifications => result?,
+                result = state.maintain() => result?,
+                result = shutdown() => { result?; info!("shutdown signal received"); }
             }
         }
         Command::Ui { listen } => ui::run(&listen).await?,
     }
+    Ok(())
+}
+
+async fn shutdown() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }

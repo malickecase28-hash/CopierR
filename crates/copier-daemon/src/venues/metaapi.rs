@@ -3,14 +3,14 @@ use crate::{
     runtime::{unix_time_ns, AppState},
 };
 use anyhow::{bail, Context, Result};
-use copier_core::{AckStatus, AgentFrame, ExecutionAck, ExecutionCommand, Platform, ServerFrame, Side, TradeAction, TradeEvent};
+use copier_core::{AckStatus, AgentFrame, BrokerPosition, ExecutionAck, ExecutionCommand, Platform, ServerFrame, Side, TradeAction, TradeEvent};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::{sync::mpsc, time::{interval, sleep, Duration, MissedTickBehavior}};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Deserialize)]
 struct PositionSnapshot {
@@ -29,6 +29,22 @@ struct PositionSnapshot {
     client_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SymbolVolume {
+    min_volume: f64,
+    max_volume: f64,
+    volume_step: f64,
+}
+
+impl SymbolVolume {
+    fn allows(&self, volume: f64) -> bool {
+        let steps = volume / self.volume_step;
+        self.volume_step.is_finite() && self.volume_step > 0.0 &&
+            volume >= self.min_volume - 1e-9 && volume <= self.max_volume + 1e-9 && (steps - steps.round()).abs() < 1e-7
+    }
+}
+
 pub async fn run_account(
     state: Arc<AppState>,
     account: AccountConfig,
@@ -37,6 +53,7 @@ pub async fn run_account(
 ) -> Result<()> {
     let direct = account.metaapi.clone().expect("validated MetaApi config");
     let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(8)
         .connect_timeout(Duration::from_secs(10))
@@ -49,42 +66,43 @@ pub async fn run_account(
         format!("https://mt-client-api-v1.{}.agiliumtrade.ai", direct.region)
     });
 
+    let include_orders = state.config.follower_risk.contains_key(&account.id) || state.config.routes.iter().any(|route| {
+        route.target_account_id == account.id && state.config.pending_routes.contains(&route.id)
+    });
+    let (mut known, initial_exposure) = fetch_snapshot(&client, &api_base, &provider_account_id, &auth_token, include_orders).await?;
     let (tx, mut rx) = mpsc::channel(state.config.queue_capacity);
-    let session_id = state.register_session(account.id.clone(), tx).await;
-    state.dispatch_queued_for(&account.id).await?;
-
-    let mut known = match fetch_positions(&client, &api_base, &provider_account_id, &auth_token).await {
-        Ok(positions) => index_positions(positions),
-        Err(err) => {
-            warn!(account = %account.id, error = %err, "initial MetaApi snapshot failed; starting empty");
-            HashMap::new()
-        }
-    };
+    let session_id = state.register_session(account.id.clone(), tx).await?;
 
     info!(account = %account.id, provider_account = %provider_account_id, region = %direct.region, "MetaApi direct venue connected");
     let mut poll = interval(Duration::from_millis(direct.poll_interval_ms));
     poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     poll.tick().await;
+    let mut symbol_cache = HashMap::<String, (Instant, SymbolVolume)>::new();
 
     let result: Result<()> = async {
+        state.observe_initial_positions(&account.id, initial_exposure).await?;
         loop {
             tokio::select! {
                 maybe_frame = rx.recv() => {
                     let Some(frame) = maybe_frame else { break; };
                     if let ServerFrame::Command(command) = frame {
-                        let ack = execute(&client, &api_base, &provider_account_id, &auth_token, direct.magic, *command).await;
+                        let checked = if command.action.adds_exposure() || command.action == TradeAction::Reduce {
+                            check_broker_volume(&client, &api_base, &provider_account_id, &auth_token, &mut symbol_cache, &command).await
+                        } else { Ok(()) };
+                        let ack = match checked {
+                            Ok(()) => execute(&client, &api_base, &provider_account_id, &auth_token, direct.magic, *command).await,
+                            Err(error) => rejected(&command, &error.to_string()),
+                        };
                         state.handle_frame(&account.id, AgentFrame::Ack(ack)).await?;
                     }
                 }
-                _ = poll.tick(), if account.role.can_publish() => {
-                    match fetch_positions(&client, &api_base, &provider_account_id, &auth_token).await {
-                        Ok(current) => {
-                            let current = index_positions(current);
-                            emit_position_diffs(&state, &account, &known, &current).await?;
-                            known = current;
-                        }
-                        Err(err) => warn!(account = %account.id, error = %err, "MetaApi position poll failed"),
+                _ = poll.tick() => {
+                    let (current, exposure) = fetch_snapshot(&client, &api_base, &provider_account_id, &auth_token, include_orders).await?;
+                    if account.role.can_publish() {
+                        emit_position_diffs(&state, &account, &known, &current).await?;
                     }
+                    state.observe_positions(&account.id, exposure).await?;
+                    known = current;
                 }
             }
         }
@@ -179,19 +197,28 @@ async fn execute(
     let timestamp = unix_time_ns();
     let position_id = command.target_order_id.clone();
     let mut body = match command.action {
-        TradeAction::Open => {
-            let action = match command.side {
-                Some(Side::Buy) => "ORDER_TYPE_BUY",
-                Some(Side::Sell) => "ORDER_TYPE_SELL",
-                None => return rejected(&command, "open command omitted side"),
+        TradeAction::Open | TradeAction::PlaceLimit | TradeAction::PlaceStop => {
+            let action = match (command.action, command.side) {
+                (TradeAction::PlaceLimit, Some(Side::Buy)) => "ORDER_TYPE_BUY_LIMIT",
+                (TradeAction::PlaceLimit, Some(Side::Sell)) => "ORDER_TYPE_SELL_LIMIT",
+                (TradeAction::PlaceStop, Some(Side::Buy)) => "ORDER_TYPE_BUY_STOP",
+                (TradeAction::PlaceStop, Some(Side::Sell)) => "ORDER_TYPE_SELL_STOP",
+                (TradeAction::Open, Some(Side::Buy)) => "ORDER_TYPE_BUY",
+                (TradeAction::Open, Some(Side::Sell)) => "ORDER_TYPE_SELL",
+                _ => return rejected(&command, "open command omitted side"),
             };
-            json!({
+            let mut body = json!({
                 "actionType": action,
                 "symbol": command.symbol,
                 "volume": command.volume,
                 "magic": magic,
                 "clientId": metaapi_client_id(&command.command_id)
-            })
+            });
+            if command.action.is_pending() {
+                body["openPrice"] = json!(command.price);
+                body["expiration"] = json!({"type": "ORDER_TIME_GTC"});
+            }
+            body
         }
         TradeAction::Modify => json!({
             "actionType": "POSITION_MODIFY",
@@ -211,8 +238,12 @@ async fn execute(
             "magic": magic,
             "clientId": metaapi_client_id(&command.command_id)
         }),
+        TradeAction::AmendPending => json!({
+            "actionType": "ORDER_MODIFY", "orderId": position_id, "openPrice": command.price,
+        }),
+        TradeAction::CancelPending => json!({ "actionType": "ORDER_CANCEL", "orderId": position_id }),
     };
-    if matches!(command.action, TradeAction::Open | TradeAction::Modify) {
+    if matches!(command.action, TradeAction::Open | TradeAction::Modify | TradeAction::PlaceLimit | TradeAction::PlaceStop | TradeAction::AmendPending) {
         if let Some(stop_loss) = command.stop_loss {
             body["stopLoss"] = json!(stop_loss);
         }
@@ -239,14 +270,14 @@ async fn execute(
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        let ack_status = if status.is_server_error() { AckStatus::Unknown } else { AckStatus::Rejected };
+        let ack_status = if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 422 | 429) { AckStatus::Rejected } else { AckStatus::Unknown };
         return ExecutionAck {
             command_id: command.command_id,
             account_id: command.target_account_id,
             status: ack_status,
             external_id: None,
             timestamp_unix_ns: timestamp,
-            message: Some(format!("MetaApi HTTP {status}: {text}")),
+            message: Some(format!("MetaApi HTTP {status}")),
         };
     }
 
@@ -264,29 +295,56 @@ async fn execute(
         }
     };
     let code = value.get("stringCode").and_then(Value::as_str).unwrap_or("");
-    let external_id = value.get("positionId").or_else(|| value.get("orderId"))
-        .and_then(value_to_string)
+    let id_field = if command.action.is_pending() { "orderId" } else { "positionId" };
+    let mut external_id = value.get(id_field).and_then(value_to_string)
         .or_else(|| position_id.clone());
     let ack_status = match code {
         "TRADE_RETCODE_DONE" | "ERR_NO_ERROR" | "TRADE_RETCODE_NO_CHANGES" => AckStatus::Filled,
-        "TRADE_RETCODE_PLACED"
-        | "TRADE_RETCODE_DONE_PARTIAL"
-        | "TRADE_RETCODE_DISCONNECTED_DURING_TRADE"
-        | "TRADE_RETCODE_TIMEOUT"
-        | "ERR_TRADE_TIMED_OUT"
-        | "ERR_NO_RESULT"
-        | "TRADE_RETCODE_UNKNOWN" => AckStatus::Unknown,
-        _ => AckStatus::Rejected,
+        "TRADE_RETCODE_PLACED" if command.action.is_pending() && command.action.adds_exposure() => AckStatus::Accepted,
+        code if code.starts_with("TRADE_RETCODE_INVALID") => AckStatus::Rejected,
+        "TRADE_RETCODE_REJECT" | "TRADE_RETCODE_MARKET_CLOSED" | "TRADE_RETCODE_NO_MONEY"
+        | "TRADE_RETCODE_TRADE_DISABLED" | "TRADE_RETCODE_DISCONNECTED_BEFORE_TRADE"
+        | "TRADE_RETCODE_REQUOTE" | "ERR_MARKET_UNKNOWN_SYMBOL" | "ERR_TRADE_POSITION_NOT_FOUND"
+        | "ERR_TRADE_ORDER_NOT_FOUND" => AckStatus::Rejected,
+        _ => AckStatus::Unknown,
     };
+    if command.action == TradeAction::Open && ack_status == AckStatus::Filled && external_id.is_none() {
+        // Some MetaTrader responses only include the order ticket. Bind by the position's client ID.
+        if let Ok(positions) = fetch_positions(client, api_base, account_id, auth_token).await {
+            let client_id = metaapi_client_id(&command.command_id);
+            let mut matches = positions.into_iter().filter(|position| position.client_id.as_deref() == Some(&client_id));
+            if let (Some(position), None) = (matches.next(), matches.next()) {
+                external_id = Some(position.id);
+            }
+        }
+    }
     ExecutionAck {
         command_id: command.command_id,
         account_id: command.target_account_id,
         status: ack_status,
         external_id,
         timestamp_unix_ns: timestamp,
-        message: value.get("message").and_then(Value::as_str).map(str::to_owned)
-            .or_else(|| (!code.is_empty()).then(|| code.to_owned())),
+        message: (!code.is_empty()).then(|| code.to_owned()),
     }
+}
+
+async fn check_broker_volume(
+    client: &Client, api_base: &str, account_id: &str, auth_token: &str,
+    cache: &mut HashMap<String, (Instant, SymbolVolume)>, command: &ExecutionCommand,
+) -> Result<()> {
+    if !cache.get(&command.symbol).is_some_and(|(stored, _)| stored.elapsed() < Duration::from_secs(300)) {
+        let mut url = url::Url::parse(api_base).context("invalid MetaApi base URL")?;
+        url.path_segments_mut().map_err(|_| anyhow::anyhow!("invalid MetaApi base URL path"))?
+            .pop_if_empty().extend(["users", "current", "accounts", account_id, "symbols", &command.symbol, "specification"]);
+        let response = client.get(url).header("auth-token", auth_token).timeout(Duration::from_secs(5)).send().await
+            .map_err(|_| anyhow::anyhow!("MetaApi symbol specification request failed"))?;
+        anyhow::ensure!(response.status().is_success(), "MetaApi symbol specification returned {}", response.status());
+        let spec = response.json().await.context("invalid MetaApi symbol specification")?;
+        if cache.len() >= 1_024 { cache.clear(); }
+        cache.insert(command.symbol.clone(), (Instant::now(), spec));
+    }
+    anyhow::ensure!(cache[&command.symbol].1.allows(command.volume), "MetaApi volume is outside the broker's minimum, maximum or step");
+    Ok(())
 }
 
 fn rejected(command: &ExecutionCommand, message: &str) -> ExecutionAck {
@@ -334,8 +392,56 @@ async fn fetch_positions(client: &Client, api_base: &str, account_id: &str, auth
     response.json().await.context("invalid MetaApi positions response")
 }
 
-fn index_positions(positions: Vec<PositionSnapshot>) -> HashMap<String, PositionSnapshot> {
-    positions.into_iter().map(|position| (position.id.clone(), position)).collect()
+fn index_positions(positions: Vec<PositionSnapshot>) -> Result<HashMap<String, PositionSnapshot>> {
+    let mut indexed = HashMap::with_capacity(positions.len());
+    for position in positions {
+        if position.id.is_empty() || position.symbol.is_empty() || !position.volume.is_finite() || position.volume <= 0.0
+            || !matches!(position.position_type.as_str(), "POSITION_TYPE_BUY" | "POSITION_TYPE_SELL")
+            || indexed.insert(position.id.clone(), position).is_some()
+        {
+            bail!("invalid or duplicate MetaApi position");
+        }
+    }
+    Ok(indexed)
+}
+
+fn broker_positions(positions: &HashMap<String, PositionSnapshot>) -> Vec<BrokerPosition> {
+    positions.values().map(|position| BrokerPosition {
+        id: position.id.clone(), lots: position.volume,
+        copier_managed: position.client_id.as_deref().is_some_and(|id| id.starts_with("CR_")),
+        pending: false,
+    }).collect()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingOrder {
+    id: String,
+    #[serde(rename = "type")]
+    order_type: String,
+    current_volume: f64,
+    client_id: Option<String>,
+}
+
+async fn fetch_snapshot(
+    client: &Client, api_base: &str, account_id: &str, auth_token: &str, include_orders: bool,
+) -> Result<(HashMap<String, PositionSnapshot>, Vec<BrokerPosition>)> {
+    let orders = async {
+        if !include_orders { return Ok(Vec::new()); }
+        let url = format!("{}/users/current/accounts/{}/orders", api_base.trim_end_matches('/'), account_id);
+        let response = client.get(url).header("auth-token", auth_token).send().await.context("MetaApi orders request failed")?;
+        anyhow::ensure!(response.status().is_success(), "MetaApi orders returned {}", response.status());
+        response.json::<Vec<PendingOrder>>().await.context("invalid MetaApi orders response")
+    };
+    let (positions, orders) = tokio::try_join!(fetch_positions(client, api_base, account_id, auth_token), orders)?;
+    let positions = index_positions(positions)?;
+    let mut exposure = broker_positions(&positions);
+    exposure.extend(orders.into_iter().filter(|order| order.order_type.ends_with("_STOP") || order.order_type.ends_with("_LIMIT"))
+        .map(|order| BrokerPosition {
+            id: order.id, lots: order.current_volume,
+            copier_managed: order.client_id.as_deref().is_some_and(|id| id.starts_with("CR_")), pending: true,
+        }));
+    Ok((positions, exposure))
 }
 
 async fn emit_position_diffs(
@@ -349,12 +455,12 @@ async fn emit_position_diffs(
             None => {
                 state.handle_frame(&account.id, AgentFrame::Event(to_event(account, position, TradeAction::Open, position.volume, Some(position.volume))?)).await?;
             }
+            Some(old) if position.position_type != old.position_type || position.symbol != old.symbol || position.volume > old.volume + f64::EPSILON => {
+                state.source_drift(&account.id, id).await?;
+            }
             Some(old) if position.volume + f64::EPSILON < old.volume => {
                 let delta = old.volume - position.volume;
                 state.handle_frame(&account.id, AgentFrame::Event(to_event(account, position, TradeAction::Reduce, delta, Some(position.volume))?)).await?;
-            }
-            Some(old) if position.volume > old.volume + f64::EPSILON => {
-                warn!(account = %account.id, position = %id, old_volume = old.volume, new_volume = position.volume, "MetaApi scale-in detected; direct copier currently leaves this position for reconciliation");
             }
             Some(old) if changed_price(old.stop_loss, position.stop_loss) || changed_price(old.take_profit, position.take_profit) => {
                 state.handle_frame(&account.id, AgentFrame::Event(to_event(account, position, TradeAction::Modify, position.volume, Some(position.volume))?)).await?;

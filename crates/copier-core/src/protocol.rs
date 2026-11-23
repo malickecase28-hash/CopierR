@@ -1,4 +1,4 @@
-use crate::model::{AckStatus, ExecutionAck, ExecutionCommand, Platform, Side, TradeAction, TradeEvent};
+use crate::model::{AckStatus, BrokerPosition, ExecutionAck, ExecutionCommand, Platform, Side, TradeAction, TradeEvent};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -16,6 +16,7 @@ pub enum AgentFrame {
     Hello(HelloFrame),
     Event(TradeEvent),
     Ack(ExecutionAck),
+    Snapshot(Vec<BrokerPosition>),
     Ping(i64),
 }
 
@@ -78,6 +79,11 @@ pub fn parse_agent_line(line: &str) -> Result<AgentFrame, WireError> {
             require_len(&fields, 3, "PING")?;
             require_version(fields[1])?;
             Ok(AgentFrame::Ping(parse_i64(fields[2], "timestamp_unix_ns")?))
+        }
+        "SNAPSHOT" => {
+            require_len(&fields, 3, "SNAPSHOT")?;
+            require_version(fields[1])?;
+            Ok(AgentFrame::Snapshot(serde_json::from_str(fields[2])?))
         }
         other => Err(WireError::UnknownFrame(other.to_owned())),
     }
@@ -174,6 +180,7 @@ pub fn encode_agent_frame(frame: &AgentFrame) -> String {
             opt_str(ack.message.as_deref()),
         ),
         AgentFrame::Ping(ts) => format!("PING\t{}\t{}\n", WIRE_VERSION, ts),
+        AgentFrame::Snapshot(positions) => format!("SNAPSHOT\t{}\t{}\n", WIRE_VERSION, serde_json::to_string(positions).expect("serializable positions")),
     }
 }
 
@@ -317,4 +324,6 @@ pub enum WireError {
     InvalidNumber(&'static str, String),
     #[error(transparent)]
     Model(#[from] crate::model::ModelError),
+    #[error("invalid snapshot JSON: {0}")]
+    Snapshot(#[from] serde_json::Error),
 }

@@ -3,19 +3,21 @@ use crate::{
     runtime::{unix_time_ns, AppState},
 };
 use anyhow::{bail, Context, Result};
-use copier_core::{AckStatus, AgentFrame, ExecutionAck, ExecutionCommand, ServerFrame, Side, TradeAction, TradeEvent};
+use copier_core::{AckStatus, AgentFrame, BrokerPosition, ExecutionAck, ExecutionCommand, ServerFrame, Side, TradeAction, TradeEvent};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
-use tokio::{sync::mpsc, time::{interval, Duration, MissedTickBehavior}};
+use tokio::{sync::mpsc, time::{interval, timeout, Duration, Instant, MissedTickBehavior}};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const APPLICATION_AUTH_REQ: i64 = 2100;
 const APPLICATION_AUTH_RES: i64 = 2101;
 const ACCOUNT_AUTH_REQ: i64 = 2102;
 const ACCOUNT_AUTH_RES: i64 = 2103;
 const NEW_ORDER_REQ: i64 = 2106;
+const CANCEL_ORDER_REQ: i64 = 2108;
+const AMEND_ORDER_REQ: i64 = 2109;
 const AMEND_POSITION_SLTP_REQ: i64 = 2110;
 const CLOSE_POSITION_REQ: i64 = 2111;
 const SYMBOLS_LIST_REQ: i64 = 2114;
@@ -27,6 +29,9 @@ const RECONCILE_RES: i64 = 2125;
 const EXECUTION_EVENT: i64 = 2126;
 const ORDER_ERROR_EVENT: i64 = 2132;
 const ERROR_RES: i64 = 2142;
+const ACCOUNTS_TOKEN_INVALIDATED_EVENT: i64 = 2147;
+const CLIENT_DISCONNECT_EVENT: i64 = 2148;
+const ACCOUNT_DISCONNECT_EVENT: i64 = 2164;
 const HEARTBEAT_EVENT: i64 = 51;
 
 #[derive(Debug, Clone)]
@@ -41,6 +46,26 @@ struct SymbolInfo {
     id: i64,
     name: String,
     lot_size_cents: f64,
+    min_units: i64,
+    max_units: i64,
+    step_units: i64,
+}
+
+impl SymbolInfo {
+    fn units(&self, lots: f64) -> Result<i64> {
+        let raw = lots * self.lot_size_cents;
+        let rounded = raw.round();
+        anyhow::ensure!(raw.is_finite() && rounded >= 1.0 && rounded < i64::MAX as f64 &&
+            (rounded - raw).abs() <= 1e-6, "cTrader volume cannot be represented exactly in broker units");
+        Ok(rounded as i64)
+    }
+
+    fn order_units(&self, lots: f64) -> Result<i64> {
+        let units = self.units(lots)?;
+        anyhow::ensure!((self.min_units..=self.max_units).contains(&units) && units % self.step_units == 0,
+            "cTrader volume is outside the broker's minimum, maximum or step");
+        Ok(units)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +86,9 @@ struct AccountRuntime {
     symbols_by_name: HashMap<String, SymbolInfo>,
     symbols_by_id: HashMap<i64, SymbolInfo>,
     positions: HashMap<String, PositionSnapshot>,
+    position_revision: u64,
+    initial_orders: Vec<BrokerPosition>,
+    order_triggers: HashMap<String, &'static str>,
 }
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -90,8 +118,12 @@ pub fn spawn_hub(
         CTraderEnvironment::Demo => global.demo_url,
     };
     tokio::spawn(async move {
-        if let Err(err) = run_hub(state, environment, url, client_id, client_secret, prepared).await {
-            error!(?environment, error = %err, "cTrader Open API hub stopped");
+        let mut delay = super::ReconnectDelay::default();
+        loop {
+            let started = Instant::now();
+            let result = run_hub(state.clone(), environment, url.clone(), client_id.clone(), client_secret.clone(), prepared.clone()).await;
+            warn!(?environment, error = ?result.err(), "cTrader Open API hub disconnected; reconnecting");
+            delay.wait(started.elapsed()).await;
         }
     });
     Ok(())
@@ -105,7 +137,8 @@ async fn run_hub(
     client_secret: String,
     accounts: Vec<HubAccount>,
 ) -> Result<()> {
-    let (mut ws, _) = connect_async(&url).await.with_context(|| format!("failed connecting cTrader Open API {url}"))?;
+    let (mut ws, _) = timeout(Duration::from_secs(15), connect_async(&url)).await?
+        .with_context(|| format!("failed connecting cTrader Open API {url}"))?;
     send_json(&mut ws, APPLICATION_AUTH_REQ, "app-auth", json!({
         "clientId": client_id,
         "clientSecret": client_secret
@@ -115,6 +148,7 @@ async fn run_hub(
     let mut runtimes = HashMap::<i64, AccountRuntime>::new();
     let (command_tx, mut command_rx) = mpsc::channel::<ExecutionCommand>(state.config.queue_capacity.saturating_mul(2));
 
+    let result: Result<()> = async {
     for prepared in accounts {
         let auth_id = format!("auth:{}", prepared.ctid);
         send_json(&mut ws, ACCOUNT_AUTH_REQ, &auth_id, json!({
@@ -145,10 +179,11 @@ async fn run_hub(
         })).await?;
         let reconcile = wait_for(&mut ws, RECONCILE_RES, Some(prepared.ctid)).await?;
         let positions = parse_reconcile_positions(&reconcile, &symbols_by_id)?;
+        let (initial_orders, order_triggers) = parse_reconcile_orders(&reconcile, &symbols_by_id)?;
 
         let local_id = prepared.local.id.clone();
         let (tx, mut rx) = mpsc::channel(state.config.queue_capacity);
-        let session_id = state.register_session(local_id.clone(), tx).await;
+        let session_id = state.register_session(local_id.clone(), tx).await?;
         let forward = command_tx.clone();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
@@ -165,18 +200,31 @@ async fn run_hub(
             symbols_by_name,
             symbols_by_id,
             positions,
+            position_revision: 0,
+            initial_orders,
+            order_triggers,
         });
-        state.dispatch_queued_for(&local_id).await?;
-        info!(account = %local_id, ctid = prepared_ctid(&runtimes, &local_id), ?environment, "cTrader Open API account connected");
     }
 
+    for runtime in runtimes.values_mut() {
+        let local_id = &runtime.account.local.id;
+        let mut positions = broker_positions(&runtime.positions);
+        positions.append(&mut runtime.initial_orders);
+        state.observe_initial_positions(local_id, positions).await?;
+        info!(account = %local_id, ctid = runtime.account.ctid, ?environment, "cTrader Open API account connected");
+    }
     let mut pending = HashMap::<String, ExecutionCommand>::new();
     let mut protection_pending = HashMap::<String, (ExecutionCommand, String)>::new();
     let mut heartbeat = interval(Duration::from_secs(10));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     heartbeat.tick().await;
+    let mut reconcile_tick = interval(Duration::from_secs(3));
+    reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    reconcile_tick.tick().await;
+    let mut reconcile_pending = HashMap::<i64, (String, Instant, u64)>::new();
+    let mut reconcile_sequence = 0u64;
+    let mut last_message = Instant::now();
 
-    let result: Result<()> = async {
         loop {
             tokio::select! {
                 maybe_command = command_rx.recv() => {
@@ -203,12 +251,49 @@ async fn run_hub(
                     }
                 }
                 _ = heartbeat.tick() => {
+                    anyhow::ensure!(last_message.elapsed() < Duration::from_secs(35), "cTrader heartbeat timed out");
                     send_json(&mut ws, HEARTBEAT_EVENT, "heartbeat", json!({})).await?;
+                }
+                _ = reconcile_tick.tick() => {
+                    for runtime in runtimes.values() {
+                        let ctid = runtime.account.ctid;
+                        if let Some((_, started, _)) = reconcile_pending.get(&ctid) {
+                            anyhow::ensure!(started.elapsed() < Duration::from_secs(15), "cTrader reconciliation timed out for account {ctid}");
+                            continue;
+                        }
+                        reconcile_sequence += 1;
+                        let request_id = format!("reconcile:{ctid}:{reconcile_sequence}");
+                        send_json(&mut ws, RECONCILE_REQ, &request_id, json!({
+                            "ctidTraderAccountId": ctid,
+                            "returnProtectionOrders": false
+                        })).await?;
+                        reconcile_pending.insert(ctid, (request_id, Instant::now(), runtime.position_revision));
+                    }
                 }
                 message = ws.next() => {
                     let Some(message) = message else { break; };
+                    last_message = Instant::now();
                     let value = parse_ws_message(message?)?;
                     let Some(value) = value else { continue; };
+                    if value.get("payloadType").and_then(as_i64) == Some(RECONCILE_RES) {
+                        let ctid = value.get("payload").and_then(|payload| payload.get("ctidTraderAccountId")).and_then(as_i64)
+                            .context("cTrader reconcile response omitted its account")?;
+                        if let Some((request, _, _)) = reconcile_pending.get(&ctid) {
+                            if value.get("clientMsgId").and_then(Value::as_str) == Some(request) {
+                                let (_, _, revision) = reconcile_pending.remove(&ctid).expect("matched reconciliation");
+                                let runtime = runtimes.get_mut(&ctid).context("unknown cTrader reconciliation account")?;
+                                if revision != runtime.position_revision { continue; }
+                                let positions = parse_reconcile_positions(&value, &runtime.symbols_by_id)?;
+                                let mut exposure = broker_positions(&positions);
+                                let (orders, triggers) = parse_reconcile_orders(&value, &runtime.symbols_by_id)?;
+                                runtime.order_triggers = triggers;
+                                exposure.extend(orders);
+                                reconcile_source_positions(&state, runtime, positions).await?;
+                                state.observe_positions(&runtime.account.local.id, exposure).await?;
+                            }
+                        }
+                        continue;
+                    }
                     handle_message(&state, &mut ws, &mut runtimes, &mut pending, &mut protection_pending, value).await?;
                 }
             }
@@ -222,9 +307,12 @@ async fn run_hub(
     result
 }
 
-fn prepared_ctid(runtimes: &HashMap<i64, AccountRuntime>, local_id: &str) -> i64 {
-    runtimes.values().find(|runtime| runtime.account.local.id == local_id)
-        .map(|runtime| runtime.account.ctid).unwrap_or_default()
+fn broker_positions(positions: &HashMap<String, PositionSnapshot>) -> Vec<BrokerPosition> {
+    positions.values().map(|position| BrokerPosition {
+        id: position.id.clone(), lots: position.volume_lots,
+        copier_managed: position.origin_command_id.is_some(),
+        pending: false,
+    }).collect()
 }
 
 async fn handle_message(
@@ -238,6 +326,9 @@ async fn handle_message(
     let payload_type = value.get("payloadType").and_then(Value::as_i64).unwrap_or_default();
     let client_msg_id = value.get("clientMsgId").and_then(Value::as_str).unwrap_or("").to_owned();
     let payload = value.get("payload").cloned().unwrap_or_else(|| json!({}));
+    if matches!(payload_type, CLIENT_DISCONNECT_EVENT | ACCOUNT_DISCONNECT_EVENT | ACCOUNTS_TOKEN_INVALIDATED_EVENT) {
+        bail!("cTrader ended the broker session ({payload_type})");
+    }
 
     if payload_type == EXECUTION_EVENT {
         let ctid = payload.get("ctidTraderAccountId").and_then(as_i64)
@@ -250,7 +341,8 @@ async fn handle_message(
 
         // ORDER_ACCEPTED and ORDER_PARTIAL_FILL are non-final. Keep the original
         // durable command outstanding until cTrader reports a final outcome.
-        if matches!(execution_type, 2 | 11) {
+        let pending_order = pending.get(&client_msg_id).is_some_and(|command| command.action.is_pending());
+        if matches!(execution_type, 2 | 11) && !pending_order {
             if let Some(runtime) = runtimes.get_mut(&ctid) {
                 update_position_from_execution(state, runtime, &payload).await?;
             }
@@ -258,23 +350,16 @@ async fn handle_message(
         }
 
         if let Some((original, external_id)) = protection_pending.remove(&client_msg_id) {
-            let status = match execution_type {
-                3 | 4 => AckStatus::Filled,
-                5..=8 => AckStatus::Rejected,
-                _ => AckStatus::Unknown,
-            };
-            let ack = ExecutionAck {
-                command_id: original.command_id.clone(),
-                account_id: original.target_account_id.clone(),
-                status,
-                external_id: Some(external_id),
-                timestamp_unix_ns: unix_time_ns(),
-                message: Some("cTrader position protection finalized".to_owned()),
-            };
-            state.handle_frame(&original.target_account_id, AgentFrame::Ack(ack)).await?;
+            // The order is filled either way; only its SL/TP may be missing (see protection_finished).
+            let failure = (!matches!(execution_type, 3 | 4))
+                .then(|| format!("cTrader SL/TP request ended with execution type {execution_type}"));
+            protection_finished(state, &original, external_id, failure).await?;
         } else if let Some(command) = pending.remove(&client_msg_id) {
-            let external_id = execution_external_id(&payload).or_else(|| command.target_order_id.clone());
-            if command.action == TradeAction::Open
+            let external_id = if pending_order { execution_order_id(&payload) } else { execution_position_id(&payload) }
+                .or_else(|| command.target_order_id.clone());
+            if command.action == TradeAction::CancelPending && execution_type == 2 {
+                pending.insert(client_msg_id, command);
+            } else if command.action == TradeAction::Open
                 && matches!(execution_type, 3 | 4)
                 && (command.stop_loss.is_some() || command.take_profit.is_some())
             {
@@ -296,9 +381,12 @@ async fn handle_message(
                     state.handle_frame(&command.target_account_id, AgentFrame::Ack(ack)).await?;
                 }
             } else {
-                let status = match execution_type {
-                    3 | 4 => AckStatus::Filled,
-                    5..=8 => AckStatus::Rejected,
+                let status = match (command.action, execution_type) {
+                    (TradeAction::PlaceLimit | TradeAction::PlaceStop, 2) => AckStatus::Accepted,
+                    (TradeAction::AmendPending, 4) | (TradeAction::CancelPending, 5) => AckStatus::Filled,
+                    (_, 7 | 8) => AckStatus::Rejected,
+                    (action, 3 | 4) if !action.is_pending() => AckStatus::Filled,
+                    (action, 5 | 6) if !action.is_pending() => AckStatus::Unknown,
                     _ => AckStatus::Unknown,
                 };
                 let ack = ExecutionAck {
@@ -333,15 +421,9 @@ async fn handle_message(
             };
             state.handle_frame(&command.target_account_id, AgentFrame::Ack(ack)).await?;
         } else if let Some((command, external_id)) = protection_pending.remove(&client_msg_id) {
-            let ack = ExecutionAck {
-                command_id: command.command_id.clone(),
-                account_id: command.target_account_id.clone(),
-                status: AckStatus::Unknown,
-                external_id: Some(external_id),
-                timestamp_unix_ns: unix_time_ns(),
-                message: Some("cTrader order filled but SL/TP protection request failed".to_owned()),
-            };
-            state.handle_frame(&command.target_account_id, AgentFrame::Ack(ack)).await?;
+            let reason = payload.get("description").or_else(|| payload.get("errorCode"))
+                .and_then(Value::as_str).unwrap_or("cTrader refused the SL/TP request");
+            protection_finished(state, &command, external_id, Some(format!("cTrader SL/TP request refused: {reason}"))).await?;
         } else {
             warn!(payload_type, client_msg_id, payload = %payload, "unmatched cTrader error event");
         }
@@ -349,8 +431,29 @@ async fn handle_message(
     Ok(())
 }
 
+/// The end of the SL/TP request that follows a filled market open. The open is acknowledged as filled with its position ID either
+/// way, so the copy is bound and the source's later changes and close still reach it. When the protection failed, the copy is
+/// recorded as unprotected (alert `protection_missing`) instead of leaving the whole command unknown: an unknown open had no
+/// binding, so the follower sat without a stop and the source's close waited behind it until an operator stepped in.
+async fn protection_finished(state: &Arc<AppState>, command: &ExecutionCommand, external_id: String, failure: Option<String>) -> Result<()> {
+    let ack = ExecutionAck {
+        command_id: command.command_id.clone(),
+        account_id: command.target_account_id.clone(),
+        status: AckStatus::Filled,
+        external_id: Some(external_id.clone()),
+        timestamp_unix_ns: unix_time_ns(),
+        message: Some(failure.clone().unwrap_or_else(|| "cTrader position protection finalized".to_owned())),
+    };
+    state.handle_frame(&command.target_account_id, AgentFrame::Ack(ack)).await?;
+    if let Some(reason) = failure {
+        state.protection_missing(command, &external_id, &reason).await?;
+    }
+    Ok(())
+}
+
 async fn update_position_from_execution(state: &Arc<AppState>, runtime: &mut AccountRuntime, payload: &Value) -> Result<()> {
     let Some(position) = payload.get("position") else { return Ok(()); };
+    runtime.position_revision += 1;
     let position_id = position.get("positionId").and_then(value_to_string)
         .ok_or_else(|| anyhow::anyhow!("cTrader position omitted id"))?;
     let status = enum_number(position.get("positionStatus"), &[
@@ -366,22 +469,49 @@ async fn update_position_from_execution(state: &Arc<AppState>, runtime: &mut Acc
         }
         return Ok(());
     }
+    if status != 1 { return Ok(()); }
 
     let current = parse_position(position, &runtime.symbols_by_id)?;
     if let Some(old) = runtime.positions.get(&position_id).cloned() {
         if runtime.account.local.role.can_publish() {
-            if current.volume_lots + f64::EPSILON < old.volume_lots {
-                emit_event(state, runtime, &current, TradeAction::Reduce, old.volume_lots - current.volume_lots, Some(current.volume_lots)).await?;
-            } else if current.volume_lots > old.volume_lots + f64::EPSILON {
-                warn!(account = %runtime.account.local.id, position = %position_id, "cTrader scale-in detected; left for reconciliation in v0.2");
-            } else if changed_price(old.stop_loss, current.stop_loss) || changed_price(old.take_profit, current.take_profit) {
-                emit_event(state, runtime, &current, TradeAction::Modify, current.volume_lots, Some(current.volume_lots)).await?;
-            }
+            emit_changed_position(state, runtime, &old, &current).await?;
         }
     } else if runtime.account.local.role.can_publish() {
         emit_event(state, runtime, &current, TradeAction::Open, current.volume_lots, Some(current.volume_lots)).await?;
     }
     runtime.positions.insert(position_id, current);
+    Ok(())
+}
+
+async fn reconcile_source_positions(
+    state: &Arc<AppState>, runtime: &mut AccountRuntime, positions: HashMap<String, PositionSnapshot>,
+) -> Result<()> {
+    if runtime.account.local.role.can_publish() {
+        for (id, current) in &positions {
+            if let Some(old) = runtime.positions.get(id) {
+                emit_changed_position(state, runtime, old, current).await?;
+            } else {
+                emit_event(state, runtime, current, TradeAction::Open, current.volume_lots, Some(current.volume_lots)).await?;
+            }
+        }
+        for (id, old) in &runtime.positions {
+            if !positions.contains_key(id) {
+                emit_event(state, runtime, old, TradeAction::Close, old.volume_lots, Some(0.0)).await?;
+            }
+        }
+    }
+    runtime.positions = positions;
+    Ok(())
+}
+
+async fn emit_changed_position(state: &Arc<AppState>, runtime: &AccountRuntime, old: &PositionSnapshot, current: &PositionSnapshot) -> Result<()> {
+    if current.volume_lots > old.volume_lots + 1e-8 || current.symbol != old.symbol || current.side != old.side {
+        state.source_drift(&runtime.account.local.id, &current.id).await?;
+    } else if current.volume_lots + 1e-8 < old.volume_lots {
+        emit_event(state, runtime, current, TradeAction::Reduce, old.volume_lots - current.volume_lots, Some(current.volume_lots)).await?;
+    } else if changed_price(old.stop_loss, current.stop_loss) || changed_price(old.take_profit, current.take_profit) {
+        emit_event(state, runtime, current, TradeAction::Modify, current.volume_lots, Some(current.volume_lots)).await?;
+    }
     Ok(())
 }
 
@@ -417,7 +547,7 @@ async fn emit_event(
 fn command_message(runtime: &AccountRuntime, command: &ExecutionCommand) -> Result<(i64, Value)> {
     let ctid = runtime.account.ctid;
     match command.action {
-        TradeAction::Open => {
+        TradeAction::Open | TradeAction::PlaceLimit | TradeAction::PlaceStop => {
             let symbol = runtime.symbols_by_name.get(&command.symbol)
                 .ok_or_else(|| anyhow::anyhow!("cTrader symbol {} not found", command.symbol))?;
             let side = match command.side {
@@ -425,42 +555,66 @@ fn command_message(runtime: &AccountRuntime, command: &ExecutionCommand) -> Resu
                 Some(Side::Sell) => 2,
                 None => bail!("cTrader open command omitted side"),
             };
-            let volume = (command.volume * symbol.lot_size_cents).round() as i64;
-            if volume <= 0 { bail!("cTrader normalized volume is zero"); }
-            Ok((NEW_ORDER_REQ, json!({
+            let volume = symbol.order_units(command.volume)?;
+            let order_type = match command.action {
+                TradeAction::PlaceLimit => 2,
+                TradeAction::PlaceStop => 3,
+                _ => 1,
+            };
+            let mut payload = json!({
                 "ctidTraderAccountId": ctid,
                 "symbolId": symbol.id,
-                "orderType": 1,
+                "orderType": order_type,
                 "tradeSide": side,
                 "volume": volume,
                 "clientOrderId": command.command_id,
                 "label": format!("CopierR:{}", command.command_id)
-            })))
+            });
+            if command.action.is_pending() {
+                let field = if command.action == TradeAction::PlaceLimit { "limitPrice" } else { "stopPrice" };
+                payload[field] = json!(command.price.context("pending order omitted its trigger")?);
+                payload["timeInForce"] = json!(2);
+                apply_protection(&mut payload, command);
+            }
+            Ok((NEW_ORDER_REQ, payload))
         }
         TradeAction::Modify => {
             let position_id = parse_target_position(command)?;
             let mut payload = json!({ "ctidTraderAccountId": ctid, "positionId": position_id });
-            if let Some(stop_loss) = command.stop_loss { payload["stopLoss"] = json!(stop_loss); }
-            if let Some(take_profit) = command.take_profit { payload["takeProfit"] = json!(take_profit); }
+            apply_protection(&mut payload, command);
             Ok((AMEND_POSITION_SLTP_REQ, payload))
         }
         TradeAction::Reduce | TradeAction::Close => {
             let position_id = parse_target_position(command)?;
             let symbol = runtime.symbols_by_name.get(&command.symbol)
                 .ok_or_else(|| anyhow::anyhow!("cTrader symbol {} not found", command.symbol))?;
-            let volume_lots = if command.action == TradeAction::Close {
-                runtime.positions.get(&position_id.to_string()).map(|position| position.volume_lots).unwrap_or(command.volume)
-            } else {
-                command.volume
-            };
-            let volume = (volume_lots * symbol.lot_size_cents).round() as i64;
+            let volume = if command.action == TradeAction::Close {
+                symbol.units(command.volume)?
+            } else { symbol.order_units(command.volume)? };
             Ok((CLOSE_POSITION_REQ, json!({
                 "ctidTraderAccountId": ctid,
                 "positionId": position_id,
                 "volume": volume
             })))
         }
+        TradeAction::AmendPending | TradeAction::CancelPending => {
+            let order_id = parse_target_position(command)?;
+            let mut payload = json!({ "ctidTraderAccountId": ctid, "orderId": order_id });
+            if command.action == TradeAction::CancelPending {
+                return Ok((CANCEL_ORDER_REQ, payload));
+            }
+            // Set the original trigger field using the authoritative order type.
+            let trigger = runtime.order_triggers.get(&order_id.to_string()).context("pending order is absent from cTrader snapshot")?;
+            payload[*trigger] = json!(command.price.context("pending amendment omitted its trigger")?);
+            apply_protection(&mut payload, command);
+            Ok((AMEND_ORDER_REQ, payload))
+        }
     }
+}
+
+fn apply_protection(payload: &mut Value, command: &ExecutionCommand) {
+    if let Some(stop_loss) = command.stop_loss { payload["stopLoss"] = json!(stop_loss); }
+    if let Some(take_profit) = command.take_profit { payload["takeProfit"] = json!(take_profit); }
 }
 
 fn parse_target_position(command: &ExecutionCommand) -> Result<i64> {
@@ -476,10 +630,15 @@ async fn send_json(ws: &mut Ws, payload_type: i64, client_msg_id: &str, payload:
         "payloadType": payload_type,
         "payload": payload
     });
-    ws.send(Message::Text(frame.to_string())).await.context("cTrader websocket send failed")
+    timeout(Duration::from_secs(10), ws.send(Message::Text(frame.to_string()))).await?
+        .context("cTrader websocket send failed")
 }
 
 async fn wait_for(ws: &mut Ws, expected: i64, account_id: Option<i64>) -> Result<Value> {
+    timeout(Duration::from_secs(15), wait_for_response(ws, expected, account_id)).await?
+}
+
+async fn wait_for_response(ws: &mut Ws, expected: i64, account_id: Option<i64>) -> Result<Value> {
     loop {
         let message = ws.next().await.ok_or_else(|| anyhow::anyhow!("cTrader websocket closed during startup"))??;
         let Some(value) = parse_ws_message(message)? else { continue; };
@@ -533,23 +692,55 @@ fn parse_symbol_details(
     for symbol in symbols {
         let id = symbol.get("symbolId").and_then(as_i64).ok_or_else(|| anyhow::anyhow!("cTrader full symbol omitted id"))?;
         let Some(name) = names.get(&id).cloned() else { continue; };
-        let lot_size_cents = symbol.get("lotSize").and_then(as_f64).unwrap_or(10_000_000.0);
-        let info = SymbolInfo { id, name: name.clone(), lot_size_cents };
+        let lot_size_cents = symbol.get("lotSize").and_then(as_f64).filter(|value| value.is_finite() && *value > 0.0)
+            .context("cTrader symbol omitted a valid lot size")?;
+        let min_units = symbol.get("minVolume").and_then(as_i64).filter(|value| *value > 0).unwrap_or(1);
+        let max_units = symbol.get("maxVolume").and_then(as_i64).filter(|value| *value >= min_units).unwrap_or(i64::MAX);
+        let step_units = symbol.get("stepVolume").and_then(as_i64).filter(|value| *value > 0).unwrap_or(1);
+        let info = SymbolInfo { id, name: name.clone(), lot_size_cents, min_units, max_units, step_units };
         by_name.insert(name, info.clone());
         by_id.insert(id, info);
     }
     Ok((by_name, by_id))
 }
 
+fn reconcile_items<'a>(value: &'a Value, field: &str) -> Result<&'a [Value]> {
+    let payload = value.get("payload").and_then(Value::as_object).context("cTrader reconcile response omitted payload")?;
+    match payload.get(field) {
+        Some(value) => Ok(value.as_array().context("invalid cTrader reconciliation list")?),
+        None => Ok(&[]),
+    }
+}
+
 fn parse_reconcile_positions(value: &Value, symbols: &HashMap<i64, SymbolInfo>) -> Result<HashMap<String, PositionSnapshot>> {
     let mut positions = HashMap::new();
-    let values = value.get("payload").and_then(|payload| payload.get("position"))
-        .and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-    for position in values {
+    for position in reconcile_items(value, "position")? {
         let parsed = parse_position(position, symbols)?;
-        positions.insert(parsed.id.clone(), parsed);
+        anyhow::ensure!(positions.insert(parsed.id.clone(), parsed).is_none(), "duplicate cTrader position in snapshot");
     }
     Ok(positions)
+}
+
+type OrderTriggers = HashMap<String, &'static str>;
+
+fn parse_reconcile_orders(value: &Value, symbols: &HashMap<i64, SymbolInfo>) -> Result<(Vec<BrokerPosition>, OrderTriggers)> {
+    let mut orders = Vec::new();
+    let mut triggers = HashMap::new();
+    for order in reconcile_items(value, "order")? {
+        let kind = enum_number(order.get("orderType"), &[("LIMIT", 2), ("STOP", 3), ("STOP_LIMIT", 6)]);
+        if !matches!(kind, Some(2 | 3 | 6)) { continue; }
+        let id = order.get("orderId").and_then(value_to_string).context("cTrader pending order omitted ID")?;
+        let trade = order.get("tradeData").context("cTrader pending order omitted trade data")?;
+        let symbol = trade.get("symbolId").and_then(as_i64).and_then(|id| symbols.get(&id)).context("unknown cTrader pending-order symbol")?;
+        let volume = trade.get("volume").and_then(as_f64).context("cTrader pending order omitted volume")?;
+        let executed = order.get("executedVolume").and_then(as_f64).unwrap_or(0.0);
+        let copier_managed = trade.get("label").and_then(Value::as_str).is_some_and(|label| label.starts_with("CopierR:"));
+        if kind != Some(6) {
+            triggers.insert(id.clone(), if kind == Some(2) { "limitPrice" } else { "stopPrice" });
+        }
+        orders.push(BrokerPosition { id, lots: (volume - executed) / symbol.lot_size_cents, copier_managed, pending: true });
+    }
+    Ok((orders, triggers))
 }
 
 fn parse_position(value: &Value, symbols: &HashMap<i64, SymbolInfo>) -> Result<PositionSnapshot> {
@@ -558,7 +749,8 @@ fn parse_position(value: &Value, symbols: &HashMap<i64, SymbolInfo>) -> Result<P
     let trade = value.get("tradeData").ok_or_else(|| anyhow::anyhow!("cTrader position omitted tradeData"))?;
     let symbol_id = trade.get("symbolId").and_then(as_i64).ok_or_else(|| anyhow::anyhow!("cTrader position omitted symbol id"))?;
     let symbol = symbols.get(&symbol_id).ok_or_else(|| anyhow::anyhow!("unknown cTrader symbol id {symbol_id}"))?;
-    let volume_cents = trade.get("volume").and_then(as_f64).unwrap_or_default();
+    let volume_cents = trade.get("volume").and_then(as_f64).filter(|volume| volume.is_finite() && *volume > 0.0)
+        .context("cTrader position omitted a valid volume")?;
     let side = match enum_number(trade.get("tradeSide"), &[("BUY", 1), ("SELL", 2)]).unwrap_or_default() {
         1 => Side::Buy,
         2 => Side::Sell,
@@ -578,9 +770,13 @@ fn parse_position(value: &Value, symbols: &HashMap<i64, SymbolInfo>) -> Result<P
     })
 }
 
-fn execution_external_id(payload: &Value) -> Option<String> {
+fn execution_position_id(payload: &Value) -> Option<String> {
     payload.get("position").and_then(|position| position.get("positionId")).and_then(value_to_string)
-        .or_else(|| payload.get("order").and_then(|order| order.get("orderId")).and_then(value_to_string))
+        .or_else(|| payload.get("order").and_then(|order| order.get("positionId")).and_then(value_to_string))
+}
+
+fn execution_order_id(payload: &Value) -> Option<String> {
+    payload.get("order").and_then(|order| order.get("orderId")).and_then(value_to_string)
 }
 
 fn unknown_ack(command: &ExecutionCommand, message: &str) -> ExecutionAck {
