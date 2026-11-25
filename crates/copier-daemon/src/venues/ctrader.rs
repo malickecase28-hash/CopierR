@@ -88,6 +88,8 @@ struct AccountRuntime {
     positions: HashMap<String, PositionSnapshot>,
     position_revision: u64,
     initial_orders: Vec<BrokerPosition>,
+    /// Pending orders as of the last reconciliation, published with the positions kept current from execution events.
+    orders: Vec<BrokerPosition>,
     order_triggers: HashMap<String, &'static str>,
 }
 
@@ -201,6 +203,7 @@ async fn run_hub(
             symbols_by_id,
             positions,
             position_revision: 0,
+            orders: initial_orders.clone(),
             initial_orders,
             order_triggers,
         });
@@ -287,6 +290,7 @@ async fn run_hub(
                                 let mut exposure = broker_positions(&positions);
                                 let (orders, triggers) = parse_reconcile_orders(&value, &runtime.symbols_by_id)?;
                                 runtime.order_triggers = triggers;
+                                runtime.orders = orders.clone();
                                 exposure.extend(orders);
                                 reconcile_source_positions(&state, runtime, positions).await?;
                                 state.observe_positions(&runtime.account.local.id, exposure).await?;
@@ -342,16 +346,24 @@ async fn handle_message(
         // ORDER_ACCEPTED and ORDER_PARTIAL_FILL are non-final. Keep the original
         // durable command outstanding until cTrader reports a final outcome.
         let pending_order = pending.get(&client_msg_id).is_some_and(|command| command.action.is_pending());
-        if matches!(execution_type, 2 | 11) && !pending_order {
+        // An SL/TP change on a position (a copied Modify, or the protection sent after a copied open) is answered by cTrader
+        // with ORDER_ACCEPTED for the protective order, and nothing more: that answer is final for it. Treating it as
+        // non-final left the command outstanding forever, and every later change and the close waited behind it (25 Nov 2026).
+        let sltp_request = protection_pending.contains_key(&client_msg_id)
+            || pending.get(&client_msg_id).is_some_and(|command| command.action == TradeAction::Modify);
+        if sltp_request {
+            info!(client_msg_id, execution_type, "cTrader answered an SL/TP request");
+        }
+        if matches!(execution_type, 2 | 11) && !pending_order && !sltp_request {
             if let Some(runtime) = runtimes.get_mut(&ctid) {
-                update_position_from_execution(state, runtime, &payload).await?;
+                apply_execution(state, runtime, &payload, execution_type).await?;
             }
             return Ok(());
         }
 
         if let Some((original, external_id)) = protection_pending.remove(&client_msg_id) {
             // The order is filled either way; only its SL/TP may be missing (see protection_finished).
-            let failure = (!matches!(execution_type, 3 | 4))
+            let failure = (!matches!(execution_type, 2 | 3 | 4))
                 .then(|| format!("cTrader SL/TP request ended with execution type {execution_type}"));
             protection_finished(state, &original, external_id, failure).await?;
         } else if let Some(command) = pending.remove(&client_msg_id) {
@@ -384,6 +396,7 @@ async fn handle_message(
                 let status = match (command.action, execution_type) {
                     (TradeAction::PlaceLimit | TradeAction::PlaceStop, 2) => AckStatus::Accepted,
                     (TradeAction::AmendPending, 4) | (TradeAction::CancelPending, 5) => AckStatus::Filled,
+                    (TradeAction::Modify, 2 | 3 | 4) => AckStatus::Filled,
                     (_, 7 | 8) => AckStatus::Rejected,
                     (action, 3 | 4) if !action.is_pending() => AckStatus::Filled,
                     (action, 5 | 6) if !action.is_pending() => AckStatus::Unknown,
@@ -402,7 +415,7 @@ async fn handle_message(
         }
 
         if let Some(runtime) = runtimes.get_mut(&ctid) {
-            update_position_from_execution(state, runtime, &payload).await?;
+            apply_execution(state, runtime, &payload, execution_type).await?;
         }
         return Ok(());
     }
@@ -451,6 +464,19 @@ async fn protection_finished(state: &Arc<AppState>, command: &ExecutionCommand, 
     Ok(())
 }
 
+/// An execution event's effect on the account: its pending orders, then its position (which republishes the snapshot). An order
+/// change with no position in the event (accepted, amended, cancelled, expired) republishes it here.
+async fn apply_execution(state: &Arc<AppState>, runtime: &mut AccountRuntime, payload: &Value, execution_type: i64) -> Result<()> {
+    let orders_changed = apply_order_execution(runtime, payload, execution_type)?;
+    if payload.get("position").is_some() {
+        update_position_from_execution(state, runtime, payload).await
+    } else if orders_changed {
+        publish_positions(state, runtime).await
+    } else {
+        Ok(())
+    }
+}
+
 async fn update_position_from_execution(state: &Arc<AppState>, runtime: &mut AccountRuntime, payload: &Value) -> Result<()> {
     let Some(position) = payload.get("position") else { return Ok(()); };
     runtime.position_revision += 1;
@@ -466,6 +492,7 @@ async fn update_position_from_execution(state: &Arc<AppState>, runtime: &mut Acc
             if runtime.account.local.role.can_publish() {
                 emit_event(state, runtime, &old, TradeAction::Close, old.volume_lots, Some(0.0)).await?;
             }
+            publish_positions(state, runtime).await?;
         }
         return Ok(());
     }
@@ -480,7 +507,17 @@ async fn update_position_from_execution(state: &Arc<AppState>, runtime: &mut Acc
         emit_event(state, runtime, &current, TradeAction::Open, current.volume_lots, Some(current.volume_lots)).await?;
     }
     runtime.positions.insert(position_id, current);
-    Ok(())
+    publish_positions(state, runtime).await
+}
+
+/// The account's positions as kept current from execution events, published as a fresh snapshot at once. A master open waits for
+/// its position in a current snapshot and a follower's next command waits for a snapshot after each fill; both waited for the
+/// 3-second reconciliation, and an execution arriving while one was in flight discarded it, so opens waited 1.4-3.2 s
+/// (23 Nov 2026 demo test). Reconciliation still runs every 3 s and corrects anything an execution event did not carry.
+async fn publish_positions(state: &Arc<AppState>, runtime: &AccountRuntime) -> Result<()> {
+    let mut exposure = broker_positions(&runtime.positions);
+    exposure.extend(runtime.orders.iter().cloned());
+    state.observe_positions(&runtime.account.local.id, exposure).await
 }
 
 async fn reconcile_source_positions(
@@ -727,20 +764,47 @@ fn parse_reconcile_orders(value: &Value, symbols: &HashMap<i64, SymbolInfo>) -> 
     let mut orders = Vec::new();
     let mut triggers = HashMap::new();
     for order in reconcile_items(value, "order")? {
-        let kind = enum_number(order.get("orderType"), &[("LIMIT", 2), ("STOP", 3), ("STOP_LIMIT", 6)]);
-        if !matches!(kind, Some(2 | 3 | 6)) { continue; }
-        let id = order.get("orderId").and_then(value_to_string).context("cTrader pending order omitted ID")?;
-        let trade = order.get("tradeData").context("cTrader pending order omitted trade data")?;
-        let symbol = trade.get("symbolId").and_then(as_i64).and_then(|id| symbols.get(&id)).context("unknown cTrader pending-order symbol")?;
-        let volume = trade.get("volume").and_then(as_f64).context("cTrader pending order omitted volume")?;
-        let executed = order.get("executedVolume").and_then(as_f64).unwrap_or(0.0);
-        let copier_managed = trade.get("label").and_then(Value::as_str).is_some_and(|label| label.starts_with("CopierR:"));
-        if kind != Some(6) {
-            triggers.insert(id.clone(), if kind == Some(2) { "limitPrice" } else { "stopPrice" });
+        if let Some((entry, trigger)) = parse_pending_order(order, symbols)? {
+            if let Some(trigger) = trigger { triggers.insert(entry.id.clone(), trigger); }
+            orders.push(entry);
         }
-        orders.push(BrokerPosition { id, lots: (volume - executed) / symbol.lot_size_cents, copier_managed, pending: true });
     }
     Ok((orders, triggers))
+}
+
+/// A pending (limit, stop or stop-limit) order as exposure, with the field its trigger lives in; None for any other order type.
+fn parse_pending_order(order: &Value, symbols: &HashMap<i64, SymbolInfo>) -> Result<Option<(BrokerPosition, Option<&'static str>)>> {
+    let kind = enum_number(order.get("orderType"), &[("LIMIT", 2), ("STOP", 3), ("STOP_LIMIT", 6)]);
+    if !matches!(kind, Some(2 | 3 | 6)) { return Ok(None); }
+    let id = order.get("orderId").and_then(value_to_string).context("cTrader pending order omitted ID")?;
+    let trade = order.get("tradeData").context("cTrader pending order omitted trade data")?;
+    let symbol = trade.get("symbolId").and_then(as_i64).and_then(|id| symbols.get(&id)).context("unknown cTrader pending-order symbol")?;
+    let volume = trade.get("volume").and_then(as_f64).context("cTrader pending order omitted volume")?;
+    let executed = order.get("executedVolume").and_then(as_f64).unwrap_or(0.0);
+    let copier_managed = trade.get("label").and_then(Value::as_str).is_some_and(|label| label.starts_with("CopierR:"));
+    let trigger = (kind != Some(6)).then(|| if kind == Some(2) { "limitPrice" } else { "stopPrice" });
+    Ok(Some((BrokerPosition { id, lots: (volume - executed) / symbol.lot_size_cents, copier_managed, pending: true }, trigger)))
+}
+
+/// Keeps the account's pending orders current from an execution event: accepted, amended or partly filled orders are kept with
+/// their remaining volume; filled, cancelled or expired ones leave. True when the list changed (the snapshot is then republished).
+fn apply_order_execution(runtime: &mut AccountRuntime, payload: &Value, execution_type: i64) -> Result<bool> {
+    let Some(order) = payload.get("order") else { return Ok(false); };
+    let Some((entry, trigger)) = parse_pending_order(order, &runtime.symbols_by_id)? else { return Ok(false); };
+    match execution_type {
+        2 | 4 | 11 => {
+            runtime.orders.retain(|held| held.id != entry.id);
+            if let Some(trigger) = trigger { runtime.order_triggers.insert(entry.id.clone(), trigger); }
+            if entry.lots > 1e-12 { runtime.orders.push(entry); }
+        }
+        3 | 5 | 6 => {
+            runtime.orders.retain(|held| held.id != entry.id);
+            runtime.order_triggers.remove(&entry.id);
+        }
+        _ => return Ok(false), // a rejected request leaves the order as it was
+    }
+    runtime.position_revision += 1; // a reconciliation already in flight predates this change
+    Ok(true)
 }
 
 fn parse_position(value: &Value, symbols: &HashMap<i64, SymbolInfo>) -> Result<PositionSnapshot> {
