@@ -143,6 +143,23 @@ async fn concurrent_duplicates_and_deferred_close_dispatch_once() {
 }
 
 #[tokio::test]
+async fn detach_check_includes_enabled_routes_and_undelivered_commands() {
+    let dir = TestDir::new();
+    let (_, app) = open(&dir, "").await;
+    let state = app.detach_check("follower").await.unwrap();
+    assert_eq!(state["can_detach"], false);
+    assert_eq!(state["enabled_routes"], serde_json::json!(["copy"]));
+    assert_eq!(state["commands"], 0);
+
+    app.handle_event(event("open", "order", TradeAction::Open))
+        .await
+        .unwrap();
+    let state = app.detach_check("master").await.unwrap();
+    assert_eq!(state["commands"], 1);
+    assert!(app.detach_check("missing").await.is_none());
+}
+
+#[tokio::test]
 async fn restart_keeps_paused_state_and_never_resends_uncertain_dispatch() {
     let dir = TestDir::new();
     let (journal, app) = open(&dir, "").await;

@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, put},
@@ -67,6 +67,7 @@ fn router(app: Arc<AppState>) -> Result<Router> {
     )?;
     Ok(Router::new()
         .route("/v1/status", get(status))
+        .route("/v1/accounts/:account_id/detach-check", get(detach_check))
         .route("/v1/pause", put(pause))
         .route("/v1/hold", put(hold))
         .route("/v1/resolve", put(resolve))
@@ -155,6 +156,19 @@ async fn status(
 ) -> Result<impl IntoResponse, StatusCode> {
     ops.authenticate(&headers)?;
     Ok(Json(ops.app.status().await))
+}
+
+async fn detach_check(
+    State(ops): State<Operations>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    ops.authenticate(&headers)?;
+    ops.app
+        .detach_check(&account_id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(Deserialize)]

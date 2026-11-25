@@ -930,6 +930,34 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn detach_check(&self, account_id: &str) -> Option<serde_json::Value> {
+        self.config.account(account_id)?;
+        let runtime = self.runtime.lock().await;
+        let involves = |source: &str, target: &str| source == account_id || target == account_id;
+        let enabled_routes: Vec<_> = self.config.routes.iter()
+            .filter(|route| route.enabled && involves(&route.source_account_id, &route.target_account_id))
+            .map(|route| &route.id)
+            .collect();
+        let mirrors = runtime.ledger.mirrors.values().chain(runtime.ledger.pending_mirrors.values())
+            .filter(|binding| involves(&binding.source_account_id, &binding.target_account_id))
+            .count();
+        let commands = runtime.ledger.commands.values()
+            .filter(|entry| involves(&entry.command.source_account_id, &entry.command.target_account_id))
+            .count();
+        let deferred = runtime.ledger.deferred.iter().filter(|entry| {
+            entry.event.source_account_id == account_id || self.config.routes.iter().any(|route| {
+                route.id == entry.route_id && route.target_account_id == account_id
+            })
+        }).count();
+        Some(serde_json::json!({
+            "can_detach": enabled_routes.is_empty() && mirrors == 0 && commands == 0 && deferred == 0,
+            "enabled_routes": enabled_routes,
+            "mirrors": mirrors,
+            "commands": commands,
+            "deferred": deferred,
+        }))
+    }
+
     pub async fn status(&self) -> serde_json::Value {
         let runtime = self.runtime.lock().await;
         let accounts: Vec<_> = self.config.accounts.iter().map(|account| {
