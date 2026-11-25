@@ -495,6 +495,35 @@ token = "t"
 }
 
 #[tokio::test]
+async fn a_hold_stops_new_trades_but_lets_closes_through() {
+    let dir = TestDir::new();
+    let (_, app) = open_route(&dir, "", "").await;
+    let (_, mut rx) = connect(&app).await;
+    copy_open(&app, &mut rx, "a", "broker-a").await;
+    app.set_hold("follower", Some("operator hold")).await.unwrap();
+
+    // a new trade waits behind the hold
+    app.handle_event(event("open-x", "x", TradeAction::Open)).await.unwrap();
+    app.pump().await.unwrap();
+    assert!(rx.try_recv().is_err(), "no open while held");
+
+    // closing an existing copy still goes out
+    app.handle_event(event("close-a", "a", TradeAction::Close)).await.unwrap();
+    app.pump().await.unwrap();
+    let close = command(&mut rx);
+    assert_eq!((close.action, close.target_order_id.as_deref()), (TradeAction::Close, Some("broker-a")));
+    app.handle_frame("follower", AgentFrame::Ack(ack(&close, Some("broker-a")))).await.unwrap();
+    app.pump().await.unwrap();
+    assert!(rx.try_recv().is_err(), "the held open still waits");
+
+    // released: the held open goes out
+    app.set_hold("follower", None).await.unwrap();
+    app.pump().await.unwrap();
+    let open_x = command(&mut rx);
+    assert_eq!((open_x.action, open_x.source_order_id.as_str()), (TradeAction::Open, "x"));
+}
+
+#[tokio::test]
 async fn full_backlog_keeps_a_close_for_later() {
     let dir = TestDir::new();
     let (_, app) = open_route(&dir, "backlog_capacity = 1", "").await;

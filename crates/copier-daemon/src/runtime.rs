@@ -479,14 +479,33 @@ impl AppState {
             .filter(|stored| stored.state != StoredCommandState::Queued)
             .map(|stored| stored.command.target_account_id.as_str())
             .collect();
+        // A hold stops what adds exposure (opens, new pending orders). Closes, reductions, SL/TP and pending changes still reach
+        // a held account, so closing on the master no longer leaves the follower open until the hold is released (25 Nov 2026).
+        // A change whose own open is still held waits behind it.
+        let held_sources: HashSet<(&str, &str)> = runtime
+            .ledger
+            .commands
+            .values()
+            .filter(|stored| {
+                stored.state == StoredCommandState::Queued
+                    && stored.command.action.adds_exposure()
+                    && runtime.ledger.holds.contains_key(&stored.command.target_account_id)
+            })
+            .map(|stored| {
+                (
+                    stored.command.target_account_id.as_str(),
+                    stored.command.source_order_id.as_str(),
+                )
+            })
+            .collect();
         let mut next = HashMap::<&str, &ExecutionCommand>::new();
         for stored in runtime.ledger.commands.values() {
             let command = &stored.command;
             let target = command.target_account_id.as_str();
-            if stored.state == StoredCommandState::Queued
-                && !busy.contains(target)
-                && !runtime.ledger.holds.contains_key(target)
-            {
+            let held = runtime.ledger.holds.contains_key(target)
+                && (command.action.adds_exposure()
+                    || held_sources.contains(&(target, command.source_order_id.as_str())));
+            if stored.state == StoredCommandState::Queued && !busy.contains(target) && !held {
                 let oldest = next.entry(target).or_insert(command);
                 if (command.created_unix_ns, &command.command_id)
                     < (oldest.created_unix_ns, &oldest.command_id)
